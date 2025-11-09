@@ -1,0 +1,106 @@
+# 这个是完整的 config.yaml 修改后的版本
+# 根据 INP 文件与命名规则做了必要的调整
+
+# 基本配置
+material_enum: [mirror, steel]  # 材料的顺序
+material_properties:
+  mirror:  # 反射镜面材料
+    E: 70000.0
+    nu: 0.33
+  steel:  # 钢材材料
+    E: 210000.0
+    nu: 0.3
+
+# 预紧力设置
+bolts:
+  - name: bolt1
+    up_surface_key: 'ASM::"bolt1 up"'   # INP 中定义的“上表面”
+    down_surface_key: 'ASM::"bolt1 down"'  # INP 中定义的“下表面”
+  - name: bolt2
+    up_surface_key: 'ASM::"bolt2 uo"'   # 注意：INP 中是“uo”而非“up”
+    down_surface_key: 'ASM::"bolt2 down"'
+  - name: bolt3
+    up_surface_key: 'ASM::"bolt3 up"'   # INP 中定义的“上表面”
+    down_surface_key: 'ASM::"bolt3 down"'  # INP 中定义的“下表面”
+
+# 材料映射与装配面设置
+part2mat:
+  mirror1: mirror
+  mirror2: mirror
+  bolt1: steel
+  bolt2: steel
+  bolt3: steel
+  auto: steel
+
+# 接触对设置（如果有手动填充接触对）
+contact_pairs:
+  # 接触对根据 INP 中的配对进行配置
+  - master_key: 'ASM::"mirror1 up"'
+    slave_key: 'ASM::"bolt1 mirror s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"mirror2 up"'
+    slave_key: 'ASM::"bolt2 mirror s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"mirror3 up"'
+    slave_key: 'ASM::"bolt3 mirror s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt1 auto s"'
+    slave_key: 'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt1 mirror s"'
+    slave_key: 'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 auto s"'
+    slave_key: 'ASM::"bolt2 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 mirror s"'
+    slave_key: 'ASM::"bolt2 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 auto s"'
+    slave_key: 'ASM::"bolt3 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror s"'
+    slave_key: 'ASM::"bolt3 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key: 'ASM::"bolt1 up"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 mirror up"'
+    slave_key: 'ASM::"bolt1 up"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt1 mirror up"'
+    slave_key: 'ASM::"bolt2 uo"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key: 'ASM::"bolt3 up"'
+    interaction: 'fri'
+
+# 训练配置：网络结构、优化器等
+network_config:
+  # 网络结构
+  model_type: pinn
+  input_dim: 3  # 3 个预紧力输入
+  output_dim: 1  # 镜面变形应力云图的输出维度（可根据实际情况调整）
+  layers: [64, 64, 32]  # 网络层结构（示意）
+
+optimizer_config:
+  type: Adam
+  learning_rate: 0.001
+  batch_size: 32
+  epochs: 500
+
+# 训练阶段配置：损失函数、能量项等
+loss_config:
+  elasticity_loss: 1.0
+  contact_loss: 0.1  # 如果启用了接触损失
+  friction_loss: 0.1  # 如果启用了摩擦损失
+
+# 可视化与结果输出配置
+output_config:
+  save_path: './results'
+  visualize: true  # 是否进行训练过程可视化
+
+
+
+# 必填：Abaqus INP 的绝对路径
+inp_path: D:/shuangfan/shuangfan.inp
