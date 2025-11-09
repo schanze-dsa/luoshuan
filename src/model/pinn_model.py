@@ -288,9 +288,15 @@ class DisplacementNet(tf.keras.Model):
         Returns:
             u: (N,3)
         """
+        # Mixed-precision policies may feed float16 inputs even though the
+        # network itself operates in float32. Force the spatial samples and
+        # conditioning vectors back to float32 before further processing.
+        x = tf.cast(x, tf.float32)
+
         # Broadcast z to N samples
         if z.shape.rank == 1:
             z = tf.reshape(z, (1, -1))
+        z = tf.cast(z, tf.float32)
         # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
         N = tf.shape(x)[0]
         B = tf.shape(z)[0]
