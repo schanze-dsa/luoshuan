@@ -128,9 +128,9 @@ class TrainerConfig:
     alm_update_every: int = 10
     resample_contact_every: int = 10
 
-    # 进度条颜色（默认保持绿色/蓝色，None 则禁用彩色）
-    build_bar_color: Optional[str] = "green"
-    train_bar_color: Optional[str] = "blue"
+    # 进度条颜色（None 则禁用彩色，使用终端默认色）
+    build_bar_color: Optional[str] = "cyan"
+    train_bar_color: Optional[str] = "cyan"
     step_bar_color: Optional[str] = "green"
 
     # 精度/随机种子
@@ -501,22 +501,11 @@ class Trainer:
         else:
             grads = tape.gradient(loss, vars_)
 
-        grad_for_norm = []
-        for g in grads:
-            if g is None:
-                continue
-            if isinstance(g, tf.IndexedSlices):
-                values = tf.cast(g.values, tf.float32) if g.values.dtype != tf.float32 else g.values
-                grad_for_norm.append(tf.IndexedSlices(values, g.indices, g.dense_shape))
-            else:
-                grad_for_norm.append(tf.cast(g, tf.float32) if g.dtype != tf.float32 else g)
-        grad_norm = tf.linalg.global_norm(grad_for_norm) if grad_for_norm else tf.constant(0.0, dtype=tf.float32)
-
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
         self.optimizer.apply_gradients(grads_and_vars)
-        return Pi, parts, stats, grad_norm
+        return Pi, parts, stats
 
     # ----------------- 训练 -----------------
     def run(self):
