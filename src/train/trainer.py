@@ -620,6 +620,8 @@ class Trainer:
                         f"Π={pi_val:.2e} {rel_txt} {d_txt} "
                         f"grad={grad_val:.2e} {ema_txt}"
                     )
+                    if step == 1:
+                        train_note += " | 首轮包含图追踪/缓存构建"
                     self._set_pbar_postfix(
                         p_step,
                         f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
@@ -772,10 +774,12 @@ class Trainer:
                             f"{label_map.get(name, name)}:{t / total_spent * 100:.0f}%"
                             for name, t in self._step_stage_times
                         )
-                        self._set_pbar_postfix(
-                            p_train,
+                        summary_note = (
                             f"step{step}耗时 {self._format_seconds(total_spent)} ({parts_txt})"
                         )
+                        if step == 1:
+                            summary_note += " | 首轮额外包括图追踪/初次缓存"
+                        self._set_pbar_postfix(p_train, summary_note)
                     self._step_stage_times.clear()
 
             # 训练结束：再存一次
