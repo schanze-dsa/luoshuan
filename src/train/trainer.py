@@ -25,8 +25,30 @@ os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 try:
     import colorama
     colorama.just_fix_windows_console()
+    _ANSI_WHITE = colorama.Fore.WHITE
+    _ANSI_RESET = colorama.Style.RESET_ALL
 except Exception:
-    pass
+    colorama = None
+    _ANSI_WHITE = ""
+    _ANSI_RESET = ""
+
+import builtins as _builtins
+
+
+def _wrap_white(text: str) -> str:
+    if not _ANSI_WHITE:
+        return text
+    return f"{_ANSI_WHITE}{text}{_ANSI_RESET}"
+
+
+def print(*values, sep: str = " ", end: str = "\n", file=None, flush: bool = False):
+    """Module-local print that forces white foreground text on stdout/stderr."""
+
+    target = sys.stdout if file is None else file
+    msg = sep.join(str(v) for v in values)
+    if target in (sys.stdout, sys.stderr):
+        msg = _wrap_white(msg)
+    _builtins.print(msg, end=end, file=target, flush=flush)
 
 # 让 src 根目录可导入
 _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".", "."))
