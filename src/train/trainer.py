@@ -128,9 +128,9 @@ class TrainerConfig:
     alm_update_every: int = 10
     resample_contact_every: int = 10
 
-    # 进度条颜色（默认保持绿色/蓝色，None 则禁用彩色）
-    build_bar_color: Optional[str] = "green"
-    train_bar_color: Optional[str] = "blue"
+    # 进度条颜色（None 则禁用彩色，使用终端默认色）
+    build_bar_color: Optional[str] = "cyan"
+    train_bar_color: Optional[str] = "cyan"
     step_bar_color: Optional[str] = "green"
 
     # 精度/随机种子
@@ -357,7 +357,7 @@ class Trainer:
 
         print(f"[INFO] Build.start  inp_path={cfg.inp_path}")
 
-        pb_kwargs = dict(total=len(steps), desc=_wrap_white("Build"), leave=True)
+        pb_kwargs = dict(total=len(steps), desc="Build", leave=True)
         if cfg.build_bar_color:
             pb_kwargs["colour"] = cfg.build_bar_color
         with tqdm(**pb_kwargs) as pb:
@@ -516,28 +516,10 @@ class Trainer:
         else:
             grads = tape.gradient(loss, vars_)
 
-        grad_for_norm = []
-        for g in grads:
-            if g is None:
-                continue
-            if isinstance(g, tf.IndexedSlices):
-                values = tf.cast(g.values, tf.float32) if g.values.dtype != tf.float32 else g.values
-                grad_for_norm.append(tf.IndexedSlices(values, g.indices, g.dense_shape))
-            else:
-                grad_for_norm.append(tf.cast(g, tf.float32) if g.dtype != tf.float32 else g)
-        grad_norm = tf.linalg.global_norm(grad_for_norm) if grad_for_norm else tf.constant(0.0, dtype=tf.float32)
-
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
         self.optimizer.apply_gradients(grads_and_vars)
-
-        # 将梯度范数注入 stats，便于外部记录且保持旧的返回结构
-        if isinstance(stats, dict):
-            stats = dict(stats)
-        else:
-            stats = {}
-        stats["train_grad_norm"] = grad_norm
         return Pi, parts, stats
 
     # ----------------- 训练 -----------------
@@ -546,13 +528,13 @@ class Trainer:
         print(f"[trainer] 当前训练设备：{self.device_summary}")
         total = self._assemble_total()
 
-        train_pb_kwargs = dict(total=self.cfg.max_steps, desc=_wrap_white("Training"), leave=True)
+        train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color
         with tqdm(**train_pb_kwargs) as p_train:
             for step in range(1, self.cfg.max_steps + 1):
                 # 子进度条：本 step 的 4 个动作
-                step_pb_kwargs = dict(total=4, leave=False, desc=_wrap_white(f"step {step}"))
+                step_pb_kwargs = dict(total=4, leave=False)
                 if self.cfg.step_bar_color:
                     step_pb_kwargs["colour"] = self.cfg.step_bar_color
                 with tqdm(**step_pb_kwargs) as p_step:
@@ -594,16 +576,7 @@ class Trainer:
                     t0 = time.perf_counter()
                     P_np = self._sample_P()
                     P_tf = tf.convert_to_tensor(P_np, dtype=tf.float32)
-                    Pi, parts, stats = self._train_step(total, P_tf)
-                    grad_tensor = None
-                    if isinstance(stats, dict):
-                        grad_tensor = stats.pop("train_grad_norm", None)
-                    if grad_tensor is None:
-                        grad_norm = 0.0
-                    elif hasattr(grad_tensor, "numpy"):
-                        grad_norm = float(grad_tensor.numpy())
-                    else:
-                        grad_norm = float(grad_tensor)
+                    Pi, parts, stats, grad_norm = self._train_step(total, P_tf)
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -620,13 +593,14 @@ class Trainer:
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
+                    grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
                     rel_txt = f"Πrel={rel_pi:.3f}"
                     d_txt = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
                     ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
                     train_note = (
                         f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}] "
                         f"Π={pi_val:.2e} {rel_txt} {d_txt} "
-                        f"grad={grad_norm:.2e} {ema_txt}"
+                        f"grad={grad_val:.2e} {ema_txt}"
                     )
                     self._set_pbar_postfix(
                         p_step,
@@ -715,7 +689,7 @@ class Trainer:
                                 if val is not None:
                                     mean_gap = float(val.numpy())
 
-                            grad_disp = f"grad={grad_norm:.2e}"
+                            grad_disp = f"grad={grad_val:.2e}"
                             rel_disp = f"Πrel={rel_pi:.3f}"
                             delta_disp = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
                             pen_disp = f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
@@ -723,8 +697,7 @@ class Trainer:
                             slip_disp = f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
                             gap_disp = f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
 
-                            self._set_pbar_postfix(
-                                p_train,
+                            p_train.set_postfix_str(
                                 f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
                                 f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
                                 f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
