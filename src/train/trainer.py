@@ -153,6 +153,9 @@ class TrainerConfig:
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
     viz_write_data: bool = True             # export displacement samples next to figure
+    viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
+    viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
+    viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -1060,6 +1063,9 @@ class Trainer:
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
+            refine_subdivisions=self.cfg.viz_refine_subdivisions,
+            refine_max_points=self.cfg.viz_refine_max_points,
+            eval_batch_size=self.cfg.viz_eval_batch_size,
         )
 
         self.last_viz_data_path = data_path
@@ -1571,6 +1577,9 @@ class Trainer:
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
+            refine_subdivisions=self.cfg.viz_refine_subdivisions,
+            refine_max_points=self.cfg.viz_refine_max_points,
+            eval_batch_size=self.cfg.viz_eval_batch_size,
         )
 
     def _visualize_after_training(self, n_samples: int = 5):
