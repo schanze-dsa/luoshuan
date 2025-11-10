@@ -142,6 +142,13 @@ class TrainerConfig:
     ckpt_dir: str = "checkpoints"
     viz_samples_after_train: int = 5
     viz_title_prefix: str = "Mirror Deflection (trained PINN)"
+    viz_style: str = "smooth"              # smooth Gouraud-shaded map by default
+    viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
+    viz_levels: int = 24                    # used when style="contour"
+    viz_symmetric: bool = True              # keep color limits symmetric around 0
+    viz_units: str = "mm"
+    viz_draw_wireframe: bool = False
+    viz_write_data: bool = True             # export displacement samples next to figure
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -210,6 +217,7 @@ class Trainer:
         self.ckpt = None
         self.ckpt_manager = None
         self.best_metric = float("inf")
+        self.last_viz_data_path: Optional[str] = None
 
         # —— 体检/调试可读
         self.X_vol = None
@@ -872,7 +880,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -907,7 +916,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -915,9 +939,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1006,7 +1040,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1041,7 +1076,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1049,9 +1099,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1140,7 +1200,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1175,7 +1236,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1183,9 +1259,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1274,7 +1360,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1309,7 +1396,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1317,9 +1419,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1327,6 +1439,9 @@ class Trainer:
     def _call_viz(self, P: np.ndarray, out_path: str, title: str):
         bare = self.cfg.mirror_surface_name
         params = {"P": tf.convert_to_tensor(P.reshape(-1), dtype=tf.float32)}
+        data_path = None
+        if self.cfg.viz_write_data and out_path:
+            data_path = os.path.splitext(out_path)[0] + ".txt"
 
         return plot_mirror_deflection_by_name(
             self.asm,
@@ -1336,6 +1451,13 @@ class Trainer:
             P_values=tuple(float(x) for x in P.reshape(-1)),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
+            data_out_path=data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
     def _visualize_after_training(self, n_samples: int = 5):
@@ -1348,7 +1470,7 @@ class Trainer:
             title = f"{self.cfg.viz_title_prefix}  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
             save_path = os.path.join(self.cfg.out_dir, f"deflection_{i+1:02d}.png")
             try:
-                self._call_viz(P, save_path, title)
+                _, _, data_path = self._call_viz(P, save_path, title)
                 if not os.path.exists(save_path):
                     try:
                         import matplotlib.pyplot as plt
@@ -1357,6 +1479,8 @@ class Trainer:
                     except Exception:
                         pass
                 print(f"[viz] saved -> {save_path}")
+                if data_path:
+                    print(f"[viz] displacement data -> {data_path}")
             except TypeError as e:
                 print("[viz] signature mismatch:", e)
             except Exception as e:
