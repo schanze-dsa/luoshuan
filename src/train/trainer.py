@@ -106,6 +106,11 @@ class TrainerConfig:
     alm_update_every: int = 10
     resample_contact_every: int = 10
 
+    # 进度条颜色（None 则禁用彩色，使用终端默认色）
+    build_bar_color: Optional[str] = "cyan"
+    train_bar_color: Optional[str] = "cyan"
+    step_bar_color: Optional[str] = "green"
+
     # 精度/随机种子
     mixed_precision: Optional[str] = "mixed_float16"
     seed: int = 42
@@ -127,6 +132,9 @@ class Trainer:
         # 默认设备描述，避免后续日志访问属性时出错
         self.device_summary = "Unknown"
         self._step_stage_times: List[Tuple[str, float]] = []
+        self._pi_baseline: Optional[float] = None
+        self._pi_ema: Optional[float] = None
+        self._prev_pi: Optional[float] = None
 
         # 显存增长
         gpus = tf.config.list_physical_devices('GPU')
@@ -312,7 +320,10 @@ class Trainer:
 
         print(f"[INFO] Build.start  inp_path={cfg.inp_path}")
 
-        with tqdm(total=len(steps), desc="Build", leave=True, colour="blue") as pb:
+        pb_kwargs = dict(total=len(steps), desc="Build", leave=True)
+        if cfg.build_bar_color:
+            pb_kwargs["colour"] = cfg.build_bar_color
+        with tqdm(**pb_kwargs) as pb:
             # 1) INP
             self.asm = load_inp(cfg.inp_path)
             print(f"[INFO] Loaded INP: surfaces={len(self.asm.surfaces)} "
@@ -480,10 +491,16 @@ class Trainer:
         print(f"[trainer] 当前训练设备：{self.device_summary}")
         total = self._assemble_total()
 
-        with tqdm(total=self.cfg.max_steps, desc="Training", leave=True, colour="blue") as p_train:
+        train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
+        if self.cfg.train_bar_color:
+            train_pb_kwargs["colour"] = self.cfg.train_bar_color
+        with tqdm(**train_pb_kwargs) as p_train:
             for step in range(1, self.cfg.max_steps + 1):
                 # 子进度条：本 step 的 4 个动作
-                with tqdm(total=4, leave=False, colour="green") as p_step:
+                step_pb_kwargs = dict(total=4, leave=False)
+                if self.cfg.step_bar_color:
+                    step_pb_kwargs["colour"] = self.cfg.step_bar_color
+                with tqdm(**step_pb_kwargs) as p_step:
                     # 1) 接触重采样
                     p_step.set_description_str(f"step {step}: 接触重采样")
                     t0 = time.perf_counter()
@@ -521,13 +538,31 @@ class Trainer:
                     t0 = time.perf_counter()
                     P_np = self._sample_P()
                     P_tf = tf.convert_to_tensor(P_np, dtype=tf.float32)
-                    Pi, parts, stats = self._train_step(total, P_tf)
+                    Pi, parts, stats, grad_norm = self._train_step(total, P_tf)
+                    pi_val = float(Pi.numpy())
+                    if self._pi_baseline is None:
+                        self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
+                    if self._pi_ema is None:
+                        self._pi_ema = pi_val
+                    else:
+                        ema_alpha = 0.1
+                        self._pi_ema = (1 - ema_alpha) * self._pi_ema + ema_alpha * pi_val
+                    rel_pi = pi_val / (self._pi_baseline or pi_val or 1.0)
+                    rel_delta = None
+                    if self._prev_pi is not None and self._prev_pi != 0.0:
+                        rel_delta = (self._prev_pi - pi_val) / abs(self._prev_pi)
+                    self._prev_pi = pi_val
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
+                    grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
+                    rel_txt = f"Πrel={rel_pi:.3f}"
+                    d_txt = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                    ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
                     train_note = (
                         f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}] "
-                        f"Π={float(Pi.numpy()):.2e}"
+                        f"Π={pi_val:.2e} {rel_txt} {d_txt} "
+                        f"grad={grad_val:.2e} {ema_txt}"
                     )
                     p_step.set_postfix_str(
                         f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
@@ -596,16 +631,43 @@ class Trainer:
                                     except Exception:
                                         pass
 
+                            pen_ratio = None
+                            stick_ratio = None
+                            slip_ratio = None
+                            mean_gap = None
+                            if isinstance(stats, dict):
+                                val = stats.get("n_pen_ratio")
+                                if val is not None:
+                                    pen_ratio = float(val.numpy())
+                                val = stats.get("t_stick_ratio")
+                                if val is not None:
+                                    stick_ratio = float(val.numpy())
+                                val = stats.get("t_slip_ratio")
+                                if val is not None:
+                                    slip_ratio = float(val.numpy())
+                                val = stats.get("n_mean_gap")
+                                if val is not None:
+                                    mean_gap = float(val.numpy())
+
+                            grad_disp = f"grad={grad_val:.2e}"
+                            rel_disp = f"Πrel={rel_pi:.3f}"
+                            delta_disp = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                            pen_disp = f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
+                            stick_disp = f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
+                            slip_disp = f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
+                            gap_disp = f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
+
                             p_train.set_postfix_str(
                                 f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
-                                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt}"
+                                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
+                                f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
                             )
                             log_note = "已记录"
                         except Exception:
                             log_note = "记录异常"
 
                         metric_name = self.cfg.save_best_on.lower()
-                        metric_val = float(Pi.numpy()) if metric_name == "pi" else float(parts["E_int"].numpy())
+                        metric_val = pi_val if metric_name == "pi" else float(parts["E_int"].numpy())
                         if metric_val < self.best_metric:
                             self.best_metric = metric_val
                             self.ckpt_manager.save(checkpoint_number=step)
