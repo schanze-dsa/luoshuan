@@ -214,12 +214,6 @@ class Trainer:
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
 
-        if cfg.model_cfg.preload_scale:
-            print(
-                f"[preload] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
-                f"scale={cfg.model_cfg.preload_scale:.2f}"
-            )
-
         # 显存增长
         gpus = tf.config.list_physical_devices('GPU')
         gpu_labels = []
