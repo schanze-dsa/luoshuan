@@ -209,8 +209,8 @@ def _prepare_config_with_autoguess():
     # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
     cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
     cfg.resample_contact_every = 1
-    #    预紧端面采样仍保持较小值以兼顾显存
-    cfg.preload_n_points_each = min(cfg.preload_n_points_each, 200)
+    #    预紧端面采样使用高密度样本以放大不同预紧力的影响
+    cfg.preload_n_points_each = max(cfg.preload_n_points_each, 800)
 
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"

@@ -175,6 +175,7 @@ class Trainer:
         self._preload_sequence_index: int = 0
         self._preload_sequence_hold: int = 0
         self._preload_current_target: Optional[np.ndarray] = None
+        self._train_vars: List[tf.Variable] = []
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
@@ -213,6 +214,12 @@ class Trainer:
                     print(
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
+
+        if cfg.model_cfg.preload_scale:
+            print(
+                f"[preload] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
+                f"scale={cfg.model_cfg.preload_scale:.2f}"
+            )
 
         # 显存增长
         gpus = tf.config.list_physical_devices('GPU')
@@ -667,6 +674,27 @@ class Trainer:
             self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, directory=cfg.ckpt_dir, max_to_keep=3)
             pb.update(1)
 
+        # 预热网络，确保所有权重在进入梯度带之前已创建，从而可以被显式 watch
+        try:
+            warmup_n = min(2048, int(self.X_vol.shape[0])) if hasattr(self, "X_vol") else 0
+        except Exception:
+            warmup_n = 0
+        if warmup_n > 0:
+            X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
+            mid = 0.5 * (float(cfg.preload_min) + float(cfg.preload_max))
+            P_mid = tf.constant([mid, mid, mid], dtype=tf.float32)
+            # 调用一次前向以创建所有变量；忽略实际输出
+            _ = self.model.u_fn(X_sample, {"P": P_mid})
+
+        self._train_vars = (
+            list(self.model.encoder.trainable_variables)
+            + list(self.model.field.trainable_variables)
+        )
+        if not self._train_vars:
+            raise RuntimeError(
+                "[trainer] 未发现可训练权重，请检查模型创建/预热流程是否成功。"
+            )
+
         print(f"[trainer] GPU allocator = {os.environ.get('TF_GPU_ALLOCATOR', '(default)')}")
         print(
             f"[contact] 状态：{'已启用' if self.contact is not None else '未启用'}"
@@ -689,11 +717,15 @@ class Trainer:
 
     @tf.function(jit_compile=False, reduce_retracing=True)
     def _train_step(self, total: TotalEnergy, P_tf: tf.Tensor):
+        vars_ = self._train_vars
+        if not vars_:
+            vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
+
         with tf.GradientTape() as tape:
+            if vars_:
+                tape.watch(vars_)
             Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
             loss = Pi
-
-        vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
 
         if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
             scaled_loss = self.optimizer.get_scaled_loss(loss)
