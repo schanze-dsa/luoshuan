@@ -709,6 +709,8 @@ class Trainer:
         if grads_and_vars:
             grad_tensors = [g for g, _ in grads_and_vars]
             grad_norm = tf.linalg.global_norm(grad_tensors)
+        else:
+            tf.print("[trainer] ⚠️ 检测到全部梯度为 None，参数未更新。请检查物理能量是否与网络输出连通。")
         self.optimizer.apply_gradients(grads_and_vars)
         return Pi, parts, stats, grad_norm
 
