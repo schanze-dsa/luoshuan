@@ -136,7 +136,7 @@ class ElasticityEnergy:
     # --------------------- 内部：分块计算 Jacobian ---------------------
     def _batch_jacobian_chunked(self, u_fn, params: Optional[Dict[str, tf.Tensor]] = None) -> tf.Tensor:
         """
-        为避免 OOM，对积分点分块，逐块用 GradientTape 计算 batch_jacobian。
+        为避免 OOM，对积分点分块，逐块用 persistent GradientTape 提取向量-雅可比乘。
         关键的数值细节：
           - 统一在 float32 下展开 tape，避免混精度在 autodiff 里的 dtype 不一致；
           - 对 X 先做缩放 Xs=X/scale，tape 对 Xs 求导，得到 J_scaled = ∂u/∂Xs；
@@ -147,14 +147,16 @@ class ElasticityEnergy:
         chunk = int(max(1, self.cfg.chunk_size))
         outs = []
 
+        eye3 = tf.eye(3, dtype=tf.float32)
+
         for s in range(0, N, chunk):
             e = min(N, s + chunk)
             Xc = self.X_tf[s:e]                      # (m,3), float32
             Xc_s = Xc / self._scale                  # (m,3), float32
 
-            # 不能把 watch_accessed_variables 设成 False，否则 tape 会忽略网络参数，
-            # 导致外层对 Π 的求导拿不到关于权重的高阶梯度，训练一开始梯度就恒为 0。
-            with tf.GradientTape(persistent=False) as tape:
+            # 使用 persistent tape 逐列提取向量-雅可比乘，避免 batch_jacobian 在 GPU 上产生巨型中间张量
+            # （形如 [m, m, 3, 3]）造成 OOM。每次仅回传一个单位基向量，显著降低显存占用。
+            with tf.GradientTape(persistent=True) as tape:
                 tape.watch(Xc_s)
                 Uc = u_fn(Xc_s * self._scale, params)    # 形状 (m,3)
                 Uc = tf.cast(Uc, tf.float32)             # 统一 float32 以便求导/后续相乘
