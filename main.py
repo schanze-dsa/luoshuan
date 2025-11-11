@@ -215,8 +215,14 @@ def _prepare_config_with_autoguess():
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"
 
-    # 5) 验证阶段可先减步数，跑通后再拉回 4000+
-    cfg.max_steps = min(cfg.max_steps, 1000)
+    # 5) 根据预紧力范围自动调整归一化（映射到约 [-1, 1]）
+    preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
+    if preload_hi <= preload_lo:
+        raise ValueError("PRELOAD_RANGE_N 的上限必须大于下限。")
+    preload_mid = 0.5 * (preload_lo + preload_hi)
+    preload_half_span = 0.5 * (preload_hi - preload_lo)
+    cfg.model_cfg.preload_shift = preload_mid
+    cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
     # =================================================
 
     return cfg, asm
