@@ -151,7 +151,7 @@ class TotalEnergy:
 
     # ---------- energy ----------
 
-    def energy(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor], Dict[str, tf.Tensor]]:
+    def energy(self, u_fn, params=None, tape=None):
         """
         Compute total potential and return:
             Π_total, parts_dict, stats_dict
@@ -170,9 +170,10 @@ class TotalEnergy:
         # Elasticity
         E_int = tf.cast(0.0, self.dtype)
         if self.elasticity is not None:
-            E_int, s = self.elasticity.energy(u_fn, params)
+            # 关键：把 tape 传进弹性项
+            E_int, estates = self.elasticity.energy(u_fn, params, tape=tape)
             parts["E_int"] = E_int
-            stats.update({f"int_{k}": v for k, v in s.items()})
+            stats.update({f"el_{k}": v for k, v in estates.items()})
 
         # Contact
         E_n = tf.cast(0.0, self.dtype)

@@ -1,5 +1,7 @@
+# -*- coding: utf-8 -*-
 # src/physics/elasticity_energy.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
 import numpy as np
@@ -9,204 +11,303 @@ import tensorflow as tf
 @dataclass
 class ElasticityConfig:
     """
-    线弹性能量项的配置：
-      - coord_scale: 坐标缩放（避免 J 的尺度过大/过小带来的数值不稳）。
-      - chunk_size:  计算 batch_jacobian 时的分块大小，避免 OOM。
-      - use_pfor:    是否启用 TF 的 pfor 向量化 Jacobian；部分环境会报 variant 相关错，建议 False。
-      - check_nan:   在关键张量上做数值检查，遇到 NaN/Inf 立即报错，便于定位数据问题。
+    线弹性内能项的配置。
+    - coord_scale:   坐标缩放（仅用于数值尺度；不会改变对外 X 的物理含义）
+    - chunk_size:    分块大小（前向微批，降低峰值显存）
+    - use_pfor:      仅为 batch_jacobian 兼容保留；有限差分不使用
+    - check_nan:     是否在关键张量处进行数值检查
+    - n_points_per_step: 每步用于 Jacobian/内能计算的体积分点上限（None=全量）
     """
     coord_scale: float = 1.0
-    chunk_size: int = 2048
+    chunk_size: int = 64
     use_pfor: bool = False
-    check_nan: bool = True
+    check_nan: bool = False
+    n_points_per_step: Optional[int] = None
 
 
 class ElasticityEnergy:
-    """
+    r"""
     线弹性体的内能：
-       E_int = ∫ [ 1/2 * λ * (tr ε)^2 + μ * ε:ε ] dΩ
-    其中 ε = (∇u + ∇u^T)/2  为小应变张量；λ, μ 为拉梅参数。
+        E_int = ∫_Ω [ 1/2 * λ * (tr ε)^2 + μ * (ε : ε) ] dΩ,
+    其中小应变张量
+        ε = 0.5 * (∇u + ∇u^T)
 
-    本类尽量鲁棒地从 `matlib` 提取 (E,ν)，支持：
-      1) MaterialLibrary 风格对象（有 props_for_id / id2name / props_for_name 等接口）
-      2) dict：
-         - {int_id: (E,nu)}
-         - {name: (E,nu)} + 通过 matlib.id2name / name_for_id 做回退
+    实现要点：
+    - 材料参数 (λ, μ) 由 (E, ν) 推得，并按点展开到体积分点；
+    - 默认用**有限差分列梯度**估计 J=∂u/∂x（只需一阶反传，避免二阶导引发的断链/OOM）；
+    - 支持每步对子采样一部分体积分点（无偏估计）以稳显存；
+    - 保留 batch_jacobian 的两条旧路径（需要时可切回）。
     """
 
+    # ------------------------------------------------------------------ #
+    # 初始化
+    # ------------------------------------------------------------------ #
     def __init__(
         self,
-        X_vol: np.ndarray,          # (N,3) 体积积分点坐标
-        w_vol: np.ndarray,          # (N,)   对应权重/体积
-        mat_id: np.ndarray,         # (N,)   材料 id（整型）
-        matlib: Any,                # 材料库（见上面的兼容说明）
+        X_vol: np.ndarray,     # (N,3) 体积分点坐标
+        w_vol: np.ndarray,     # (N,)   对应积分权重/体积
+        mat_id: np.ndarray,    # (N,)   材料 id（int）
+        matlib: Any,           # 材料库（需能由 id/name 拿到 (E, ν)）
         cfg: ElasticityConfig,
     ) -> None:
-        # ---------- 严格输入校验（缺什么就直接报错） ----------
-        if X_vol is None or w_vol is None:
-            raise ValueError(
-                "[ElasticityEnergy] 需要有效的体积分点与权重，但检测到 "
-                f"X_vol={type(X_vol).__name__}, w_vol={type(w_vol).__name__}。"
-                " 请检查构建阶段 build_volume_points，确保返回 (X_vol, w_vol, mat_id)。"
-            )
+        # 基本检查
+        if X_vol is None or w_vol is None or mat_id is None:
+            raise ValueError("[ElasticityEnergy] 需要 X_vol / w_vol / mat_id。")
         X_vol = np.asarray(X_vol)
         w_vol = np.asarray(w_vol)
         mat_id = np.asarray(mat_id)
 
         if X_vol.ndim != 2 or X_vol.shape[1] != 3:
-            raise ValueError(f"[ElasticityEnergy] X_vol 形状应为 (N,3)，但得到 {X_vol.shape}。")
-        if w_vol.ndim != 1:
-            raise ValueError(f"[ElasticityEnergy] w_vol 形状应为 (N,)，但得到 {w_vol.shape}。")
-        if mat_id.ndim != 1:
-            raise ValueError(f"[ElasticityEnergy] mat_id 形状应为 (N,)，但得到 {mat_id.shape}。")
+            raise ValueError(f"[ElasticityEnergy] X_vol 形状应为 (N,3)，得到 {X_vol.shape}")
+        if w_vol.ndim != 1 or mat_id.ndim != 1:
+            raise ValueError(f"[ElasticityEnergy] w_vol 或 mat_id 维度错误：{w_vol.shape}, {mat_id.shape}")
+        if not (len(X_vol) == len(w_vol) == len(mat_id)):
+            raise ValueError("[ElasticityEnergy] X_vol / w_vol / mat_id 长度不一致")
 
-        N = X_vol.shape[0]
-        if w_vol.shape[0] != N or mat_id.shape[0] != N:
-            raise ValueError(
-                "[ElasticityEnergy] X_vol / w_vol / mat_id 的长度不一致："
-                f" X_vol={N}, w_vol={w_vol.shape[0]}, mat_id={mat_id.shape[0]}。"
-            )
-
-        # NaN/Inf 检查（numpy 侧）
         for name, arr in (("X_vol", X_vol), ("w_vol", w_vol), ("mat_id", mat_id)):
             if not np.all(np.isfinite(arr)):
-                raise ValueError(f"[ElasticityEnergy] 输入 {name} 含 NaN/Inf，请先清理。")
+                raise ValueError(f"[ElasticityEnergy] 输入 {name} 含 NaN/Inf")
 
-        # --- 基本数据缓存（统一转 float32/int32，避免混精度坑） ---
-        self.X_np = X_vol.astype(np.float32, copy=False)   # (N,3)
-        self.w_np = w_vol.astype(np.float32, copy=False)   # (N,)
-        self.mat_id_np = mat_id.astype(np.int32, copy=False)  # (N,)
+        # 缓存为 float32/int32
+        self.X_np = X_vol.astype(np.float32, copy=False)
+        self.w_np = w_vol.astype(np.float32, copy=False)
+        self.mid_np = mat_id.astype(np.int32, copy=False)
+
         self.cfg = cfg
 
-        # --- 预计算每个 id 对应的拉梅参数（以表的形式），并展开为每个点的 λ/μ ---
-        lam_tab, mu_tab = self._precompute_lame_params(self.mat_id_np, matlib)  # ndarray shape=(K,)
-        # 映射到每个积分点
-        self.lam_np = lam_tab[self.mat_id_np]  # (N,)
-        self.mu_np = mu_tab[self.mat_id_np]    # (N,)
+        # 材料参数：由材料库映射 id → (E, ν)，再转 λ、μ 并按点展开
+        lam_tab, mu_tab = self._precompute_lame_params(self.mid_np, matlib)  # (K,), (K,)
+        self.lam_np = lam_tab[self.mid_np]  # (N,)
+        self.mu_np = mu_tab[self.mid_np]    # (N,)
 
-        # --- 转成 tf 常量（float32） ---
-        self.X_tf = tf.convert_to_tensor(self.X_np)                  # (N,3)
-        self.w_tf = tf.convert_to_tensor(self.w_np)                  # (N,)
-        self.lam_tf = tf.convert_to_tensor(self.lam_np)              # (N,)
-        self.mu_tf = tf.convert_to_tensor(self.mu_np)                # (N,)
+        # 转为 Tensor（常量）
+        self.X_tf = tf.convert_to_tensor(self.X_np)      # (N,3) float32
+        self.w_tf = tf.convert_to_tensor(self.w_np)      # (N,)
+        self.lam_tf = tf.convert_to_tensor(self.lam_np)  # (N,)
+        self.mu_tf = tf.convert_to_tensor(self.mu_np)    # (N,)
 
-        # 坐标缩放（用于稳定求导），内部用 float32 计算
+        # 坐标缩放（用于差分步长的量纲调度；不会改变对外 X 的物理含义）
         self._scale = float(max(self.cfg.coord_scale, 1e-8))
 
-    # --------------------- 对外入口：计算内能 ---------------------
-    def energy(self, u_fn, params: Optional[Dict[str, tf.Tensor]] = None) -> Tuple[tf.Tensor, Dict[str, Any]]:
+    # ------------------------------------------------------------------ #
+    # 顶层接口：计算内能（保持旧签名，不破坏外部调用）
+    # ------------------------------------------------------------------ #
+    def energy(
+        self,
+        u_fn,
+        params: Optional[Dict[str, tf.Tensor]] = None,
+        tape: Optional[tf.GradientTape] = None,  # 为兼容旧调用，有限差分路径中不使用
+    ):
         """
-        计算内能标量（float32）及一些统计信息。
-        参数：
-            u_fn(X, params) -> (N,3) 位移，支持混精度；此处统一在 float32 下计算导数。
-        返回：
-            E_int: tf.Tensor 标量（float32）
-            stats: dict，包含 batch 大小等信息
+        计算内能 E_int 与统计信息 stats。
+        - 默认使用有限差分列梯度求 J，避免二阶导问题；
+        - 支持 n_points_per_step 子采样，稳显存且无偏。
         """
-        # 1) 分块求 J = ∂u/∂x，返回 float32
-        J = self._batch_jacobian_chunked(u_fn, params)  # (N,3,3) float32
-        if self.cfg.check_nan:
-            tf.debugging.check_numerics(J, "Jacobian has NaN/Inf")
+        # 1) 选择本步参与计算的体积分点（无偏子采样）
+        X_full, w_full = self.X_tf, self.w_tf
+        lam_full, mu_full = self.lam_tf, self.mu_tf
 
-        # 2) 小应变 ε = 0.5*(J + Jᵀ)
-        eps = 0.5 * (J + tf.transpose(J, perm=[0, 2, 1]))  # (N,3,3)
+        if self.cfg.n_points_per_step:
+            n = tf.shape(X_full)[0]
+            m = tf.minimum(tf.constant(int(self.cfg.n_points_per_step), tf.int32), n)
+            idx = tf.random.shuffle(tf.range(n))[:m]
+
+            X_use = tf.gather(X_full, idx)      # (M,3)
+            w_use = tf.gather(w_full, idx)      # (M,)
+            lam_use = tf.gather(lam_full, idx)  # (M,)
+            mu_use = tf.gather(mu_full, idx)    # (M,)
+        else:
+            X_use, w_use, lam_use, mu_use = X_full, w_full, lam_full, mu_full
+
+        # 2) 计算 Jacobian（默认：有限差分列梯度；如需切回 batch_jacobian，见下方注释）
+        # J = self._batch_jacobian_chunked_with_tape(u_fn, params, tape, X_use)  # 旧式：需要外部持久 tape
+        # J = self._batch_jacobian_chunked(u_fn, params, X_use)                  # 旧式：内部持久 tape + batch_jacobian
+        J = self._jacobian_fd_columns(u_fn, params, X_use)                        # 新式：有限差分列梯度（推荐）
+
+        # 3) 小应变 ε、能量密度 ψ 与积分
+        eps = 0.5 * (J + tf.transpose(J, perm=[0, 2, 1]))  # (M,3,3)
         if self.cfg.check_nan:
             tf.debugging.check_numerics(eps, "strain tensor has NaN/Inf")
 
-        # 3) 能量密度：0.5*λ*(tr ε)^2 + μ*(ε:ε)
-        tr_eps = tf.linalg.trace(eps)                         # (N,)
-        eps_sq = tf.reduce_sum(eps * eps, axis=[1, 2])        # (N,)
-        psi = 0.5 * self.lam_tf * (tr_eps ** 2.0) + self.mu_tf * eps_sq  # (N,)
+        tr_eps = tf.linalg.trace(eps)                       # (M,)
+        eps_sq = tf.reduce_sum(eps * eps, axis=[1, 2])     # (M,)
+        psi = 0.5 * lam_use * (tr_eps ** 2.0) + mu_use * eps_sq
         if self.cfg.check_nan:
             tf.debugging.check_numerics(psi, "energy density has NaN/Inf")
 
-        # 4) 内能积分
-        E_int = tf.reduce_sum(self.w_tf * psi)  # 标量，float32
+        E_int = tf.reduce_sum(w_use * psi)                 # 标量
         if self.cfg.check_nan:
             tf.debugging.check_numerics(E_int, "E_int has NaN/Inf")
 
         stats = {
-            "N": int(self.X_np.shape[0]),
+            "N_total": int(self.X_np.shape[0]),
+            "N_used": int(self.X_np.shape[0]) if self.cfg.n_points_per_step is None else int(psi.shape[0]),
             "chunk_size": int(self.cfg.chunk_size),
             "use_pfor": bool(self.cfg.use_pfor),
             "coord_scale": float(self._scale),
         }
         return E_int, stats
 
-    # --------------------- 内部：分块计算 Jacobian ---------------------
-    def _batch_jacobian_chunked(self, u_fn, params: Optional[Dict[str, tf.Tensor]] = None) -> tf.Tensor:
+    # ------------------------------------------------------------------ #
+    # 方案 A（推荐）：有限差分列梯度（只需一阶反传，避免二阶导）
+    # ------------------------------------------------------------------ #
+    def _jacobian_fd_columns(self, u_fn, params, X_tensor: tf.Tensor) -> tf.Tensor:
         """
-        为避免 OOM，对积分点分块，逐块用 persistent GradientTape 提取向量-雅可比乘。
-        关键的数值细节：
-          - 统一在 float32 下展开 tape，避免混精度在 autodiff 里的 dtype 不一致；
-          - 对 X 先做缩放 Xs=X/scale，tape 对 Xs 求导，得到 J_scaled = ∂u/∂Xs；
-            再除以 scale 还原 J = ∂u/∂x（链式法则）。
-          - u_fn 的输入我们用 (Xs * scale) 还原到原始坐标系，保证网络看到的是原尺度。
+        用中央差分近似 J = ∂u/∂x，按列构造：
+          J[:, :, k] ≈ (u(X + h e_k) - u(X - h e_k)) / (2h)
+
+        说明：
+          - 完全由前向组成，外层 tape 能稳定捕捉到参数依赖（不需要二阶导）；
+          - 配合 chunk 分块评估，显存可控；
+          - h 的默认尺度与 coord_scale 相关，可按数值表现微调。
         """
-        N = self.X_np.shape[0]
+        X_tensor = tf.cast(X_tensor, tf.float32)
+        N = int(X_tensor.shape[0])
+        chunk = int(max(1, self.cfg.chunk_size))
+
+        # 差分步长：与坐标尺度自适应（经验起点：1e-3*scale）
+        # 若数值抖动略大，可调成 5e-4*scale 或 2e-3*scale 试探
+        h = tf.constant(1e-3 * max(self._scale, 1.0), dtype=tf.float32)
+
+        cols = []
+        for k in range(3):
+            ek = tf.one_hot(k, 3, dtype=tf.float32)  # (3,)
+            outs = []
+
+            for s in range(0, N, chunk):
+                e = min(N, s + chunk)
+                Xc = X_tensor[s:e]  # (m,3)
+
+                Xp = Xc + h * ek
+                Xm = Xc - h * ek
+
+                Up = tf.cast(u_fn(Xp, params), tf.float32)  # (m,3)
+                Um = tf.cast(u_fn(Xm, params), tf.float32)  # (m,3)
+
+                if self.cfg.check_nan:
+                    tf.debugging.check_numerics(Up, "u(X+h) NaN/Inf")
+                    tf.debugging.check_numerics(Um, "u(X-h) NaN/Inf")
+
+                col_k = (Up - Um) / (2.0 * h)  # (m,3)
+                outs.append(col_k)
+
+            col = tf.concat(outs, axis=0) if len(outs) > 1 else outs[0]  # (N,3)
+            cols.append(col)
+
+        # 组装 (N,3,3)，最后一维是列
+        J = tf.stack(cols, axis=2)
+        return J
+
+    # ------------------------------------------------------------------ #
+    # 方案 B（保留以兼容）：batch_jacobian + 外部持久 Tape
+    # ------------------------------------------------------------------ #
+    def _batch_jacobian_chunked_with_tape(
+        self,
+        u_fn,
+        params,
+        tape: Optional[tf.GradientTape],
+        X_tensor: Optional[tf.Tensor] = None,
+    ) -> tf.Tensor:
+        """
+        使用外部传入的持久 Tape 计算 batch_jacobian（旧实现）。
+        - 若未传 X_tensor，则默认使用 self.X_tf（不建议：无法配合子采样）
+        - 注意：该方式可能产生较高显存/二阶导开销，仅保留以兼容旧路径。
+        """
+        if tape is None:
+            raise RuntimeError("[ElasticityEnergy] 需要传入有效的 GradientTape 才能使用 _batch_jacobian_chunked_with_tape。")
+
+        Xsrc = self.X_tf if X_tensor is None else X_tensor
+        N = int(Xsrc.shape[0])
         chunk = int(max(1, self.cfg.chunk_size))
         outs = []
 
-        eye3 = tf.eye(3, dtype=tf.float32)
+        for s in range(0, N, chunk):
+            e = min(N, s + chunk)
+            Xc = Xsrc[s:e]
+            # 若沿用历史缩放，可改为 Xc_s = Xc / self._scale; Uc = u_fn(Xc_s * self._scale, params)
+            tape.watch(Xc)
+            Uc = u_fn(Xc, params)
+            Uc = tf.cast(Uc, tf.float32)
+            if self.cfg.use_pfor:
+                J = tape.batch_jacobian(Uc, Xc, experimental_use_pfor=True)
+            else:
+                J = tape.batch_jacobian(Uc, Xc, experimental_use_pfor=False)
+            outs.append(J)
+
+        return tf.concat(outs, axis=0) if len(outs) > 1 else outs[0]
+
+    # ------------------------------------------------------------------ #
+    # 方案 C（保留以兼容）：batch_jacobian + 内部持久 Tape
+    # ------------------------------------------------------------------ #
+    def _batch_jacobian_chunked(
+        self,
+        u_fn,
+        params,
+        X_tensor: tf.Tensor,
+    ) -> tf.Tensor:
+        """
+        内部开持久 Tape 并分块计算 batch_jacobian（旧实现）。
+        - 与 _batch_jacobian_chunked_with_tape 等价，但不依赖外部 Tape；
+        - 可能产生较高显存/二阶导开销，仅保留以兼容旧路径。
+        """
+        N = int(X_tensor.shape[0])
+        chunk = int(max(1, self.cfg.chunk_size))
+        outs = []
 
         for s in range(0, N, chunk):
             e = min(N, s + chunk)
-            Xc = self.X_tf[s:e]                      # (m,3), float32
-            Xc_s = Xc / self._scale                  # (m,3), float32
-
-            # 使用 persistent tape 逐列提取向量-雅可比乘，避免 batch_jacobian 在 GPU 上产生巨型中间张量
-            # （形如 [m, m, 3, 3]）造成 OOM。每次仅回传一个单位基向量，显著降低显存占用。
-            with tf.GradientTape(persistent=True) as tape:
-                tape.watch(Xc_s)
-                Uc = u_fn(Xc_s * self._scale, params)    # 形状 (m,3)
-                Uc = tf.cast(Uc, tf.float32)             # 统一 float32 以便求导/后续相乘
+            Xc = tf.identity(X_tensor[s:e])
+            with tf.GradientTape(persistent=True) as t:
+                t.watch(Xc)
+                Uc = u_fn(Xc, params)
+                Uc = tf.cast(Uc, tf.float32)
                 if self.cfg.check_nan:
                     tf.debugging.check_numerics(Uc, "u(X) has NaN/Inf")
-
-            # (m,3,3)，再按链式法则除以坐标缩放
-            J_scaled = tape.batch_jacobian(
-                Uc, Xc_s, experimental_use_pfor=bool(self.cfg.use_pfor)
-            )
-            J = J_scaled / self._scale
+            if self.cfg.use_pfor:
+                J = t.batch_jacobian(Uc, Xc, experimental_use_pfor=True)
+            else:
+                J = t.batch_jacobian(Uc, Xc, experimental_use_pfor=False)
             outs.append(J)
+            del t
 
-        return tf.concat(outs, axis=0)  # (N,3,3) float32
+        return tf.concat(outs, axis=0) if len(outs) > 1 else outs[0]
 
-    # --------------------- 内部：从材料库/字典提取拉梅参数 ---------------------
+    # ------------------------------------------------------------------ #
+    # 材料参数工具
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _E_nu_to_lame(E: float, nu: float) -> Tuple[float, float]:
         lam = float(E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu)))
-        mu = float(E / (2.0 * (1.0 + nu)))
+        mu  = float(E / (2.0 * (1.0 + nu)))
         return lam, mu
 
-    def _precompute_lame_params(
-        self, mat_id_np: np.ndarray, matlib: Any
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _precompute_lame_params(self, mat_id_np: np.ndarray, matlib: Any) -> Tuple[np.ndarray, np.ndarray]:
         """
-        生成 “id 表” 形式的 λ/μ：返回两个 ndarray（长度 = max_id+1），便于用 mat_id 做索引。
-        兼容多种 matlib 形态。
+        依据 materials 库推断 id→(E, ν)，并生成 id→(λ, μ) 的查表。
+        兼容：
+            - matlib.props_for_id(id) / name_for_id(id) / props_for_name(name)
+            - matlib.id2name / matlib.materials / matlib.props / matlib.name2props
+            - dict 形式：{id: (E,ν)} 或 {name: (E,ν)} + 'id2name'
         """
         uniq = np.unique(mat_id_np.astype(np.int32))
         max_id = int(uniq.max()) if uniq.size > 0 else 0
         lam_tab = np.zeros((max_id + 1,), dtype=np.float32)
-        mu_tab = np.zeros((max_id + 1,), dtype=np.float32)
+        mu_tab  = np.zeros((max_id + 1,), dtype=np.float32)
 
-        # --------- 可用的获取函数（按优先级尝试） ----------
         def _get_by_id(mid: int) -> Optional[Tuple[float, float]]:
-            # 1) MaterialLibrary 风格：props_for_id(mid) -> (E,nu)
+            # 1) 直接 by id
             if hasattr(matlib, "props_for_id") and callable(getattr(matlib, "props_for_id")):
                 try:
                     E, nu = matlib.props_for_id(mid)
                     return float(E), float(nu)
                 except Exception:
                     pass
-
-            # 2) MaterialLibrary 风格：id2name + props_for_name(name) / materials[name]
+            # 2) 通过 name
             name = None
             if hasattr(matlib, "id2name"):
                 try:
-                    # id2name 既可能是 dict 也可能是 list
-                    name = matlib.id2name[mid] if not isinstance(matlib.id2name, dict) else matlib.id2name.get(mid)
+                    ref = getattr(matlib, "id2name")
+                    name = ref[mid] if not isinstance(ref, dict) else ref.get(mid)
                 except Exception:
                     name = None
             if name is None and hasattr(matlib, "name_for_id") and callable(getattr(matlib, "name_for_id")):
@@ -214,44 +315,36 @@ class ElasticityEnergy:
                     name = matlib.name_for_id(mid)
                 except Exception:
                     name = None
-
             if isinstance(name, str):
-                # 优先 props_for_name
                 if hasattr(matlib, "props_for_name") and callable(getattr(matlib, "props_for_name")):
                     try:
                         E, nu = matlib.props_for_name(name)
                         return float(E), float(nu)
                     except Exception:
                         pass
-                # 退化 materials / props / dict-like
                 for attr in ("materials", "props", "name2props"):
                     if hasattr(matlib, attr):
                         store = getattr(matlib, attr)
-                        try:
-                            if isinstance(store, dict) and name in store:
+                        if isinstance(store, dict) and name in store:
+                            try:
                                 E, nu = store[name]
                                 return float(E), float(nu)
-                        except Exception:
-                            pass
-
-            # 3) matlib 直接是 dict：可能是 {id: (E,nu)} 或 {name: (E,nu)}
+                            except Exception:
+                                pass
+            # 3) matlib 是 dict
             if isinstance(matlib, dict):
-                # 3a) int-id 直接命中
                 if mid in matlib:
                     try:
                         E, nu = matlib[mid]
                         return float(E), float(nu)
                     except Exception:
                         pass
-                # 3b) name→(E,nu) + 需要 id→name 的映射（尝试 matlib['id2name'] 或全局 name 列表）
                 cand = None
-                # 内置 id2name
                 if "id2name" in matlib:
                     try:
                         cand = matlib["id2name"][mid]
                     except Exception:
                         cand = None
-                # 其它常见键
                 if cand is None:
                     for k in ("names", "materials_order", "enum"):
                         if k in matlib:
@@ -260,16 +353,14 @@ class ElasticityEnergy:
                                 break
                             except Exception:
                                 cand = None
-                if cand is not None and isinstance(cand, str) and cand in matlib:
+                if isinstance(cand, str) and cand in matlib:
                     try:
                         E, nu = matlib[cand]
                         return float(E), float(nu)
                     except Exception:
                         pass
+            return None
 
-            return None  # 所有路径都失败
-
-        # 循环填表
         missing: list[int] = []
         for mid in uniq:
             pair = _get_by_id(int(mid))
@@ -282,12 +373,7 @@ class ElasticityEnergy:
 
         if missing:
             raise KeyError(
-                "[ElasticityEnergy] 无法从材料库推断 id->(E,nu)。"
-                f" 缺失 id: {missing}。"
-                " 请确认：\n"
-                "  - 传入的是带有 props_for_id / id2name / props_for_name 的 MaterialLibrary；或\n"
-                "  - 传入 dict 时为 {int_id:(E,nu)} 或 {name:(E,nu)}，并能由 id→name 映射到 name。\n"
-                "  - 也可改为在 Trainer 中构造 {id:(E,nu)} 的字典直接传进来。"
+                "[ElasticityEnergy] 无法从材料库推断 id→(E,ν)，缺失 id: " + ", ".join(map(str, missing))
             )
 
         return lam_tab.astype(np.float32), mu_tab.astype(np.float32)

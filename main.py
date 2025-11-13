@@ -202,10 +202,11 @@ def _prepare_config_with_autoguess():
     cfg.model_cfg.field.residual_skips = (3, 6, 8)
 
     # 2) 把 Jacobian 前向+求导放在 CPU，并分块处理；关闭 pfor 降图复杂度
-    cfg.elas_cfg.jac_chunk = 128             # 64/128/256 视显存调整
+    cfg.elas_cfg.jac_chunk = 128       # 64/128/256 视显存调整
+    cfg.elas_cfg.chunk_size = 128
     cfg.elas_cfg.jac_device = "CPU"          # 关键：U+J 在 CPU，避免 GPU OOM
     cfg.elas_cfg.use_pfor = False            # 关闭 pfor
-
+    cfg.elas_cfg.n_points_per_step = 4096
     # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
     cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
     cfg.resample_contact_every = 1
@@ -224,7 +225,7 @@ def _prepare_config_with_autoguess():
     cfg.model_cfg.preload_shift = preload_mid
     cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
     # =================================================
-
+    print("elas_cfg =", vars(cfg.elas_cfg))
     return cfg, asm
 
 

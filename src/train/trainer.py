@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Mapping
 
 import numpy as np
+from tensorflow.python.util import deprecation
 import tensorflow as tf
 from tqdm.auto import tqdm  # 仅用 tqdm.auto，适配 PyCharm/终端
 
@@ -715,38 +716,95 @@ class Trainer:
         )
         return total
 
-    @tf.function(jit_compile=False, reduce_retracing=True)
-    def _train_step(self, total: TotalEnergy, P_tf: tf.Tensor):
-        vars_ = self._train_vars
-        if not vars_:
-            vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
+    # 在 Trainer 类里新增/覆盖这个方法
+    def _collect_trainable_variables(self):
+        m = self.model
 
-        use_loss_scaling = isinstance(
-            self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer
-        )
+        # 1) 标准 keras.Model 路径
+        if hasattr(m, "trainable_variables") and m.trainable_variables:
+            return m.trainable_variables
+
+        vars_list = []
+
+        # 2) 常见容器属性（按你工程里常见命名，必要时可在这里增减）
+        common_attrs = [
+            "field", "net", "model", "encoder", "cond_encoder", "cond_enc",
+            "embed", "embedding", "backbone", "trunk", "head",
+            "blocks", "layers"
+        ]
+        for name in common_attrs:
+            sub = getattr(m, name, None)
+            if sub is None:
+                continue
+            if hasattr(sub, "trainable_variables"):
+                vars_list += list(sub.trainable_variables)
+            elif isinstance(sub, (list, tuple)):
+                for layer in sub:
+                    if hasattr(layer, "trainable_variables"):
+                        vars_list += list(layer.trainable_variables)
+
+        # 3) 去重
+        seen, out = set(), []
+        for v in vars_list:
+            if v is None:
+                continue
+            vid = id(v)
+            if vid in seen:
+                continue
+            seen.add(vid)
+            out.append(v)
+
+        # 4) 兜底（可能为空：例如图尚未 build）
+        if not out:
+            try:
+                out = list(tf.compat.v1.trainable_variables())
+            except Exception:
+                out = []
+        if not out:
+            raise RuntimeError(
+                "[trainer] 找不到可训练变量。请确认 DisplacementModel 的 Keras 子模块已构建完毕，"
+                "如仍为空，可在 _collect_trainable_variables.common_attrs 中补充实际属性名。"
+            )
+        return out
+
+    def _train_step(self, total, P_tf):
+        model = self.model
+        opt = self.optimizer
+
+        # 关键改动：用收集器拿到真正的可训练变量
+        train_vars = self._collect_trainable_variables()
 
         with tf.GradientTape() as tape:
-            if vars_:
-                tape.watch(vars_)
-            Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
-            loss = tf.cast(Pi, tf.float32)
+            # 有限差分 J 不需要把 tape 传进 energy
+            Pi, parts, stats = total.energy(model.u_fn, params={"P": P_tf}, tape=None)
 
-        if use_loss_scaling:
-            scaled_loss = self.optimizer.get_scaled_loss(loss)
-            scaled_grads = tape.gradient(scaled_loss, vars_)
-            grads = self.optimizer.get_unscaled_gradients(scaled_grads)
+            reg = tf.add_n(model.losses) if getattr(model, "losses", None) else 0.0
+            loss = Pi + reg
+
+            use_loss_scale = hasattr(opt, "get_scaled_loss")
+            if use_loss_scale:
+                scaled_loss = opt.get_scaled_loss(loss)
+
+        if use_loss_scale:
+            scaled_grads = tape.gradient(scaled_loss, train_vars)
+            grads = opt.get_unscaled_gradients(scaled_grads)
         else:
-            grads = tape.gradient(loss, vars_)
+            grads = tape.gradient(loss, train_vars)
 
-        if self.cfg.grad_clip_norm:
-            grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
-        grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
-        if not grads_and_vars:
-            raise RuntimeError("[trainer] 所有梯度均为 None，训练无法继续。请确认位移网络与能量项之间没有断开依赖。")
+        if not any(g is not None for g in grads):
+            raise RuntimeError(
+                "[trainer] 所有梯度均为 None，训练无法继续。请确认损失在 tape 作用域内构建，且未用 .numpy()/np.* 切断图。")
 
-        grad_tensors = [g for g, _ in grads_and_vars]
-        grad_norm = tf.linalg.global_norm(grad_tensors)
-        self.optimizer.apply_gradients(grads_and_vars)
+        # 计算/裁剪梯度范数（可选）
+        non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
+        g_list, v_list = zip(*non_none)
+        grad_norm = tf.linalg.global_norm(g_list)
+
+        clip_norm = getattr(self, "clip_grad_norm", None) or getattr(self.cfg, "clip_grad_norm", None)
+        if clip_norm is not None and float(clip_norm) > 0.0:
+            g_list, _ = tf.clip_by_global_norm(g_list, clip_norm)
+
+        opt.apply_gradients(zip(g_list, v_list))
         return Pi, parts, stats, grad_norm
 
     # ----------------- 训练 -----------------

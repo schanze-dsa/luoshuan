@@ -10,6 +10,7 @@ physics/preload_model.py
     自动把 SurfaceDef（ELEMENT 面）转换为 (X,N,w)。
   - _coerce_surface_like_to_points(): 统一把多种“表面样式”落成点集，需要时利用 asm。
   - energy(): 使用 (X + u) · N 的积分形式累加，权重为 w，全部使用 tf.float32。
+  - _u_fn_chunked(): 对 u_fn 前向做 micro-batch，避免一次性大批量前向引起显存峰值。
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ class BoltSurfaceSpec:
 class PreloadConfig:
     epsilon: float = 1e-12     # 数值安全项
     work_coeff: float = 1.0    # 预紧功系数，可按需要扩展
+    # 可选：前向分块大小（若未在 cfg 里设置，也可由 _u_fn_chunked 内部默认取 2048）
+    # forward_chunk: Optional[int] = None
 
 
 @dataclass
@@ -161,7 +164,7 @@ class PreloadWork:
         mp = getattr(asm, "surfaces", None) or getattr(asm, "surface_map", None) or {}
         if isinstance(mp, dict) and key in mp:
             val = mp[key]
-            X, N, w = _coerce_surface_like_to_points(val, n_points_each, asm)  # <<< 修正：接受 asm
+            X, N, w = _coerce_surface_like_to_points(val, n_points_each, asm)  # <<< 接受 asm
             return X.astype(np.float32), N.astype(np.float32), w.astype(np.float32)
 
         # 3) 兜底：装配自带方法
@@ -187,6 +190,36 @@ class PreloadWork:
         raise KeyError(f"[PreloadWork] 找不到表面 '{key}' 的点集。"
                        f" 请检查 asm.surfaces / assembly.surfaces.get_surface_points / asm.get_surface_points。")
 
+    # --------- 前向分块（避免显存峰值） ---------
+    def _u_fn_chunked(self, u_fn, params, X, batch: int = None) -> tf.Tensor:
+        """
+        对大批量坐标 X 分块调用位移网络 u_fn，避免一次性前向造成显存峰值。
+        - u_fn: 形如 u_fn(X, params) -> (N,3)
+        - params: 训练时传入的额外参数（如预紧力编码）
+        - X: (N,3) 张量或 ndarray；允许已是 float16/float32 Tensor
+        - batch: 每个 micro-batch 的大小；None 时使用 cfg.forward_chunk 或 2048
+        返回: (N,3) 与输入顺序一致的拼接结果（float32）
+        """
+        if batch is None:
+            batch = int(getattr(self.cfg, "forward_chunk", 2048))
+        batch = max(1, int(batch))
+
+        # 注意：若 X 已是 Tensor 且 dtype=fp16，tf.convert_to_tensor(..., dtype=fp32) 会报错；
+        # 正确做法是先 convert，再显式 cast。
+        X = tf.convert_to_tensor(X)
+        if X.dtype != tf.float32:
+            X = tf.cast(X, tf.float32)
+
+        n = int(X.shape[0])
+
+        outs = []
+        for s in range(0, n, batch):
+            e = min(n, s + batch)
+            Xi = X[s:e]                   # (m,3) float32
+            Ui = u_fn(Xi, params)         # (m,3)（网络内部可用混合精度）
+            outs.append(tf.cast(Ui, tf.float32))
+        return tf.concat(outs, axis=0)    # (N,3) float32
+
     # --------- 物理量计算 ---------
     def _bolt_delta(self, u_fn, params, bolt: BoltSampleData) -> tf.Tensor:
         """
@@ -197,11 +230,14 @@ class PreloadWork:
         policy = tf.keras.mixed_precision.global_policy()
         compute_dtype = getattr(policy, "compute_dtype", tf.float32)
 
-        # 上侧：在传入 u_fn 前就转换到计算 dtype，避免图中混入 float32/float16 张量
+        # 上侧
         X_up = tf.cast(tf.convert_to_tensor(bolt.X_up), compute_dtype)  # (m,3)
         N_up = tf.cast(tf.convert_to_tensor(bolt.N_up), compute_dtype)  # (m,3)
         w_up = tf.cast(tf.convert_to_tensor(bolt.w_up), compute_dtype)  # (m,)
-        u_up = tf.cast(u_fn(X_up, params), compute_dtype)               # (m,3)
+        u_up = tf.cast(
+            self._u_fn_chunked(u_fn, params, X_up, batch=int(getattr(self.cfg, "forward_chunk", 2048))),
+            compute_dtype
+        )  # (m,3)
         s_up = tf.reduce_sum((X_up + u_up) * N_up, axis=1) * w_up       # (m,)
         I_up = tf.cast(tf.reduce_sum(s_up), tf.float32)
 
@@ -212,7 +248,10 @@ class PreloadWork:
         X_dn = tf.cast(tf.convert_to_tensor(bolt.X_dn), compute_dtype)
         N_dn = tf.cast(tf.convert_to_tensor(bolt.N_dn), compute_dtype)
         w_dn = tf.cast(tf.convert_to_tensor(bolt.w_dn), compute_dtype)
-        u_dn = tf.cast(u_fn(X_dn, params), compute_dtype)
+        u_dn = tf.cast(
+            self._u_fn_chunked(u_fn, params, X_dn, batch=int(getattr(self.cfg, "forward_chunk", 2048))),
+            compute_dtype
+        )  # (m,3)
         s_dn = tf.reduce_sum((X_dn + u_dn) * N_dn, axis=1) * w_dn
         I_dn = tf.cast(tf.reduce_sum(s_dn), tf.float32)
 
