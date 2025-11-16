@@ -321,8 +321,20 @@ class TotalEnergy:
         target_params = params
         if isinstance(params, dict) and params.get("stages"):
             stages = params["stages"]
-            if stages:
-                target_params = stages[-1]
+            if isinstance(stages, dict):
+                stage_tensor_P = stages.get("P")
+                stage_tensor_feat = stages.get("P_hat")
+                if stage_tensor_P is not None:
+                    target_params = {"P": stage_tensor_P[-1]}
+                    if stage_tensor_feat is not None:
+                        target_params["P_hat"] = stage_tensor_feat[-1]
+            elif isinstance(stages, (list, tuple)) and stages:
+                last_stage = stages[-1]
+                if isinstance(last_stage, dict):
+                    target_params = last_stage
+                else:
+                    p_val, z_val = last_stage
+                    target_params = {"P": p_val, "P_hat": z_val}
         if self.contact is not None:
             self.contact.update_multipliers(u_fn, target_params)
 
