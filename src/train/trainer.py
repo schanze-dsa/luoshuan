@@ -483,7 +483,25 @@ class Trainer:
             order_txt = ""
             if order is not None:
                 try:
-                    order_txt = " order=" + "-".join(str(int(x) + 1) for x in list(order))
+                    order_list = [int(x) for x in list(order)]
+                    human_order = "-".join(str(idx + 1) for idx in order_list)
+                    ordered_values: Optional[List[int]] = None
+                    if P_np is not None and len(order_list) == len(P_np):
+                        ordered_values = []
+                        for idx in order_list:
+                            if 0 <= idx < len(P_np):
+                                ordered_values.append(int(P_np[idx]))
+                            else:
+                                ordered_values = None
+                                break
+                    if ordered_values:
+                        order_txt = (
+                            f" order={human_order}(P序=["
+                            + ",".join(str(val) for val in ordered_values)
+                            + "])"
+                        )
+                    else:
+                        order_txt = f" order={human_order}"
                 except Exception:
                     order_txt = " order=?"
             postfix = (
