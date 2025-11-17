@@ -128,23 +128,27 @@ preload_staging:
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
 contact_pairs:
-  # 镜面与各螺栓帽/垫片接触
-  - master_key: 'ASM::"mirror1 up"'
-    slave_key:  'ASM::"bolt1 mirror s"'
-    interaction: 'fri'      # 考虑摩擦
-  - master_key: 'ASM::"mirror2 up"'
-    slave_key:  'ASM::"bolt2 mirror s"'
+  # INP 中定义的 13 组接触对（主/从表面名需与 INP 完全一致）
+  - master_key: 'ASM::"mirror1 auto"'
+    slave_key:  'ASM::"auto mirror1"'
     interaction: 'fri'
-  - master_key: 'ASM::"mirror3 up"'
-    slave_key:  'ASM::"bolt3 mirror s"'
+  - master_key: 'ASM::"bolt1 auto down"'
+    slave_key:  'ASM::"bolt1 down"'
     interaction: 'fri'
-
-  # 各螺栓头/垫片与其下部结构的接触
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt1 up"'
+    interaction: 'fri'
   - master_key: 'ASM::"bolt1 auto s"'
     slave_key:  'ASM::"bolt1 s"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt1 mirror s"'
     slave_key:  'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 auto down"'
+    slave_key:  'ASM::"bolt2 down"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt2 uo"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt2 auto s"'
     slave_key:  'ASM::"bolt2 s"'
@@ -152,25 +156,17 @@ contact_pairs:
   - master_key: 'ASM::"bolt2 mirror s"'
     slave_key:  'ASM::"bolt2 s"'
     interaction: 'fri'
+  - master_key: 'ASM::"bolt3 auto down"'
+    slave_key:  'ASM::"bolt3 down"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt3 up"'
+    interaction: 'fri'
   - master_key: 'ASM::"bolt3 auto s"'
     slave_key:  'ASM::"bolt3 s"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt3 mirror s"'
     slave_key:  'ASM::"bolt3 s"'
-    interaction: 'fri'
-
-  # 螺栓上表面之间的接触（防止装配间隙导致相对位移异常）
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 mirror up"'
-    slave_key:  'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 mirror up"'
-    slave_key:  'ASM::"bolt2 uo"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt3 up"'
     interaction: 'fri'
 
 # ------------------------------------------------------------
