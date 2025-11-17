@@ -460,9 +460,12 @@ class Trainer:
                     mean_gap = float(val.numpy())
 
             grad_disp = f"grad={grad_val:.2e}"
-            rel_disp = f"Πrel={rel_pi:.3f}"
+            rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+            rel_disp = (
+                f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+            )
             delta_disp = (
-                f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                f"ΔΠ={rel_delta * 100:+.1f}%" if rel_delta is not None else "ΔΠ=--"
             )
             pen_disp = (
                 f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
@@ -1203,8 +1206,15 @@ class Trainer:
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
                     grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
-                    rel_txt = f"Πrel={rel_pi:.3f}"
-                    d_txt = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                    rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+                    rel_txt = (
+                        f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+                    )
+                    d_txt = (
+                        f"ΔΠ={rel_delta * 100:+.1f}%"
+                        if rel_delta is not None
+                        else "ΔΠ=--"
+                    )
                     ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
                     order_txt = ""
                     if order_np is not None:
