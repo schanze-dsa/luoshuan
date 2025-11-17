@@ -278,6 +278,12 @@ def _prepare_config_with_autoguess():
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
 
+    cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
+    if "grad_clip_norm" in optimizer_cfg:
+        cfg.grad_clip_norm = float(optimizer_cfg["grad_clip_norm"])
+    if "log_every" in optimizer_cfg:
+        cfg.log_every = int(optimizer_cfg["log_every"])
+
     # ===== 预紧分阶段 / 顺序设置 =====
     staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
 
@@ -351,6 +357,15 @@ def _prepare_config_with_autoguess():
     cfg.loss_focus_terms = tuple(focus_terms)
     cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
 
+    # 若启用分阶段加载但 focus_terms 未包含 W_pre，则自动加入以增强预紧信号
+    if cfg.preload_use_stages and "W_pre" not in cfg.loss_focus_terms:
+        cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["W_pre"])
+
+    cfg.resample_contact_every = int(
+        cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
+    )
+    cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
+
 
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
     # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
@@ -385,7 +400,6 @@ def _prepare_config_with_autoguess():
                     stage_multiplier = max(stage_multiplier, len(entry))
 
     contact_target = cfg.n_contact_points_per_pair
-    cfg.resample_contact_every = 1
     if stage_multiplier > 1:
         per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
         approx_total_contact = per_stage_contact * stage_multiplier
@@ -531,6 +545,14 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
     print(f"  - 接触采样 n_contact_points_per_pair = {cfg.n_contact_points_per_pair}")
     print(f"  - 预紧采样 preload_n_points_each = {cfg.preload_n_points_each}")
     print(f"  - 预紧力范围 N = {cfg.preload_min} ~ {cfg.preload_max}")
+    print(f"  - 学习率 lr = {cfg.lr}")
+    print(
+        f"  - 梯度裁剪 grad_clip_norm = {getattr(cfg, 'grad_clip_norm', None)}"
+    )
+    print(
+        f"  - 接触重采样 resample_contact_every = {cfg.resample_contact_every}"
+    )
+    print(f"  - ALM 更新周期 alm_update_every = {cfg.alm_update_every}")
     print(f"  - 材料库（name -> (E, nu)）：{cfg.materials}")
     print(f"  - Part→材料：{cfg.part2mat}")
     print("======================================================================\n")
