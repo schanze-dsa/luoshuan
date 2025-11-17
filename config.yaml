@@ -177,7 +177,7 @@ network_config:
   model_type: pinn         # 之后会 DFEM 化：网络预测节点位移/场
   input_dim: 3             # 例如三个预紧力或加载参数
   output_dim: 1            # 目标量维度；如需输出完整位移场可在代码中扩展
-  layers: [64, 64, 32]
+  layers: [64, 64, 32
 
 optimizer_config:
   type: Adam
