@@ -63,7 +63,7 @@ from inp_io.inp_parser import load_inp, AssemblyModel
 from mesh.volume_quadrature import build_volume_points
 from mesh.contact_pairs import ContactPairSpec, build_contact_map, resample_contact_map
 from physics.material_lib import MaterialLibrary
-from model.pinn_model import create_displacement_model, ModelConfig
+from model.pinn_model import create_displacement_model, ModelConfig, DisplacementModel
 from physics.elasticity_energy import ElasticityEnergy, ElasticityConfig
 from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
@@ -1535,111 +1535,15 @@ class Trainer:
 
         n_bolts = max(1, len(self.cfg.preload_specs) or 3)
 
-        class _PINNModule(tf.Module):
-            def __init__(self, model, cfg, n_bolts):
-                super().__init__()
-                self._model = model
-                self._use_stages = bool(cfg.preload_use_stages)
-                self._shift = tf.constant(cfg.model_cfg.preload_shift, dtype=tf.float32)
-                self._scale = tf.constant(cfg.model_cfg.preload_scale, dtype=tf.float32)
-                self._n_bolts = int(n_bolts)
-
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[None], dtype=tf.float32, name="P"),
-                    tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
-                ]
-            )
-            def __call__(self, X, P, order):
-                params = self._prepare_params(P, order)
-                return self._model.u_fn(X, params)
-
-            def _prepare_params(self, P, order):
-                P = tf.reshape(P, (self._n_bolts,))
-                if not self._use_stages:
-                    return {"P": P}
-                order = self._normalize_order(order)
-                stage_P, stage_feat = self._build_stage_tensors(P, order)
-                return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
-
-            def _normalize_order(self, order):
-                order = tf.reshape(order, (self._n_bolts,))
-                default = tf.range(self._n_bolts, dtype=tf.int32)
-                cond = tf.reduce_all(order >= 0)
-                order = tf.where(cond, order, default)
-                minv = tf.reduce_min(order)
-                maxv = tf.reduce_max(order)
-
-                def _one_based():
-                    return order - 1
-
-                order = tf.cond(
-                    tf.logical_and(tf.greater_equal(minv, 1), tf.less_equal(maxv, self._n_bolts)),
-                    _one_based,
-                    lambda: order,
-                )
-                return order
-
-            def _build_stage_tensors(self, P, order):
-                stage_count = self._n_bolts
-                cumulative = tf.zeros_like(P)
-                mask = tf.zeros_like(P)
-                loads_ta = tf.TensorArray(tf.float32, size=stage_count)
-                masks_ta = tf.TensorArray(tf.float32, size=stage_count)
-                last_ta = tf.TensorArray(tf.float32, size=stage_count)
-
-                def body(i, cum, mask_vec, loads, masks, lasts):
-                    bolt = tf.gather(order, i)
-                    bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
-                    load_val = tf.gather(P, bolt)
-                    idx = tf.reshape(bolt, (1, 1))
-                    cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
-                    mask_vec = tf.tensor_scatter_nd_update(
-                        mask_vec, idx, tf.ones((1,), dtype=tf.float32)
-                    )
-                    loads = loads.write(i, cum)
-                    masks = masks.write(i, mask_vec)
-                    last_vec = tf.zeros_like(P)
-                    last_vec = tf.tensor_scatter_nd_update(
-                        last_vec, idx, tf.ones((1,), dtype=tf.float32)
-                    )
-                    lasts = lasts.write(i, last_vec)
-                    return i + 1, cum, mask_vec, loads, masks, lasts
-
-                _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
-                    lambda i, *_: tf.less(i, stage_count),
-                    body,
-                    (0, cumulative, mask, loads_ta, masks_ta, last_ta),
-                )
-
-                stage_P = loads_ta.stack()
-                stage_masks = masks_ta.stack()
-                stage_last = last_ta.stack()
-
-                indices = tf.reshape(order, (-1, 1))
-                ranks = tf.cast(tf.range(stage_count), tf.float32)
-                rank_vec = tf.tensor_scatter_nd_update(
-                    tf.zeros((self._n_bolts,), tf.float32), indices, ranks
-                )
-                if stage_count > 1:
-                    rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
-                else:
-                    rank_vec = tf.zeros_like(rank_vec)
-
-                feats_ta = tf.TensorArray(tf.float32, size=stage_count)
-                for i in range(stage_count):
-                    norm = (stage_P[i] - self._shift) / self._scale
-                    feat = tf.concat(
-                        [norm, stage_masks[i], stage_last[i], rank_vec], axis=0
-                    )
-                    feats_ta = feats_ta.write(i, feat)
-
-                stage_feat = feats_ta.stack()
-                return stage_P, stage_feat
-
-        module = _PINNModule(self.model, self.cfg, n_bolts)
-        tf.saved_model.save(module, export_dir)
+        module = _SavedModelModule(
+            model=self.model,
+            use_stages=bool(self.cfg.preload_use_stages),
+            shift=float(self.cfg.model_cfg.preload_shift),
+            scale=float(self.cfg.model_cfg.preload_scale),
+            n_bolts=n_bolts,
+        )
+        serving_fn = module.run.get_concrete_function()
+        tf.saved_model.save(module, export_dir, signatures={"serving_default": serving_fn})
         print(f"[trainer] SavedModel exported -> {export_dir}")
         return export_dir
 
@@ -1823,3 +1727,108 @@ class Trainer:
                 print("[viz] signature mismatch:", e)
             except Exception as e:
                 print("[viz] error:", e)
+
+
+class _SavedModelModule(tf.Module):
+    """TensorFlow module exposing the PINN forward pass for SavedModel export."""
+
+    def __init__(self, model: DisplacementModel, use_stages: bool,
+                 shift: float, scale: float, n_bolts: int):
+        super().__init__(name="pinn_saved_model")
+        self._model = model
+        self._use_stages = bool(use_stages)
+        self._shift = tf.constant(shift, dtype=tf.float32)
+        self._scale = tf.constant(scale, dtype=tf.float32)
+        self._n_bolts = int(max(1, n_bolts))
+
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=[None], dtype=tf.float32, name="P"),
+            tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
+        ]
+    )
+    def run(self, X, P, order):
+        params = self._prepare_params(P, order)
+        return self._model.u_fn(X, params)
+
+    def _prepare_params(self, P, order):
+        P = tf.reshape(P, (self._n_bolts,))
+        if not self._use_stages:
+            return {"P": P}
+        order = self._normalize_order(order)
+        stage_P, stage_feat = self._build_stage_tensors(P, order)
+        return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
+
+    def _normalize_order(self, order):
+        order = tf.reshape(order, (self._n_bolts,))
+        default = tf.range(self._n_bolts, dtype=tf.int32)
+        cond = tf.reduce_all(order >= 0)
+        order = tf.where(cond, order, default)
+        minv = tf.reduce_min(order)
+        maxv = tf.reduce_max(order)
+
+        def _one_based():
+            return order - 1
+
+        order = tf.cond(
+            tf.logical_and(tf.greater_equal(minv, 1), tf.less_equal(maxv, self._n_bolts)),
+            _one_based,
+            lambda: order,
+        )
+        return order
+
+    def _build_stage_tensors(self, P, order):
+        stage_count = self._n_bolts
+        cumulative = tf.zeros_like(P)
+        mask = tf.zeros_like(P)
+        loads_ta = tf.TensorArray(tf.float32, size=stage_count)
+        masks_ta = tf.TensorArray(tf.float32, size=stage_count)
+        last_ta = tf.TensorArray(tf.float32, size=stage_count)
+
+        def body(i, cum, mask_vec, loads, masks, lasts):
+            bolt = tf.gather(order, i)
+            bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
+            load_val = tf.gather(P, bolt)
+            idx = tf.reshape(bolt, (1, 1))
+            cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
+            mask_vec = tf.tensor_scatter_nd_update(
+                mask_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            loads = loads.write(i, cum)
+            masks = masks.write(i, mask_vec)
+            last_vec = tf.zeros_like(P)
+            last_vec = tf.tensor_scatter_nd_update(
+                last_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            lasts = lasts.write(i, last_vec)
+            return i + 1, cum, mask_vec, loads, masks, lasts
+
+        _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
+            lambda i, *_: tf.less(i, stage_count),
+            body,
+            (0, cumulative, mask, loads_ta, masks_ta, last_ta),
+        )
+
+        stage_P = loads_ta.stack()
+        stage_masks = masks_ta.stack()
+        stage_last = last_ta.stack()
+
+        indices = tf.reshape(order, (-1, 1))
+        ranks = tf.cast(tf.range(stage_count), tf.float32)
+        rank_vec = tf.tensor_scatter_nd_update(
+            tf.zeros((self._n_bolts,), tf.float32), indices, ranks
+        )
+        if stage_count > 1:
+            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+        else:
+            rank_vec = tf.zeros_like(rank_vec)
+
+        feats_ta = tf.TensorArray(tf.float32, size=stage_count)
+        for i in range(stage_count):
+            norm = (stage_P[i] - self._shift) / self._scale
+            feat = tf.concat([norm, stage_masks[i], stage_last[i], rank_vec], axis=0)
+            feats_ta = feats_ta.write(i, feat)
+
+        stage_feat = feats_ta.stack()
+        return stage_P, stage_feat
