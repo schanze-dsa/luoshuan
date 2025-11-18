@@ -13,6 +13,7 @@ from train.attach_ties_bcs import attach_ties_and_bcs_from_inp
 import os
 import sys
 import time
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
 
@@ -142,11 +143,18 @@ class TrainerConfig:
 
     # 训练超参
     max_steps: int = 1000
+    adam_steps: Optional[int] = None
     lr: float = 1e-3
     grad_clip_norm: Optional[float] = 1.0
     log_every: int = 1
     alm_update_every: int = 10
     resample_contact_every: int = 10
+    lbfgs_enabled: bool = False
+    lbfgs_max_iter: int = 200
+    lbfgs_tolerance: float = 1e-6
+    lbfgs_history_size: int = 50
+    lbfgs_line_search: int = 50
+    lbfgs_reuse_last_batch: bool = True
 
     # 进度条颜色（None 则禁用彩色，使用终端默认色）
     build_bar_color: Optional[str] = "cyan"
@@ -194,6 +202,7 @@ class Trainer:
         self._preload_current_target: Optional[np.ndarray] = None
         self._preload_current_order: Optional[np.ndarray] = None
         self._last_preload_order: Optional[np.ndarray] = None
+        self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
 
         if cfg.preload_sequence:
@@ -1054,6 +1063,23 @@ class Trainer:
             )
         return out
 
+    def _compute_total_loss(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        adaptive: bool = True,
+    ):
+        Pi_raw, parts, stats = total.energy(self.model.u_fn, params=params, tape=None)
+        Pi = Pi_raw
+        if self.loss_state is not None:
+            if adaptive:
+                update_loss_weights(self.loss_state, parts, stats)
+            Pi = combine_loss(parts, self.loss_state)
+        reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+        loss = Pi + reg
+        return loss, Pi, parts, stats
+
     def _train_step(self, total, preload_case: Dict[str, np.ndarray]):
         model = self.model
         opt = self.optimizer
@@ -1064,20 +1090,7 @@ class Trainer:
         params = self._make_preload_params(preload_case)
 
         with tf.GradientTape() as tape:
-            # 1) 先用 TotalEnergy 计算各个分量和“基线”Π_raw
-            Pi_raw, parts, stats = total.energy(model.u_fn, params=params, tape=None)
-
-            # 2) 根据当前残差更新自适应权重，并用 parts 重新组合总能量 Π
-            if self.loss_state is not None:
-                update_loss_weights(self.loss_state, parts, stats)
-                Pi = combine_loss(parts, self.loss_state)   # 使用当前权重组合
-            else:
-                Pi = Pi_raw  # 没有自适应状态就退回原始 Π
-
-            # 3) 加上 Keras 模型自带的正则项
-            reg = tf.add_n(model.losses) if getattr(model, "losses", None) else 0.0
-
-            loss = Pi + reg
+            loss, Pi, parts, stats = self._compute_total_loss(total, params, adaptive=True)
 
             use_loss_scale = hasattr(opt, "get_scaled_loss")
             if use_loss_scale:
@@ -1108,6 +1121,106 @@ class Trainer:
 
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
+
+    def _flatten_tensor_list(
+        self, tensors: Sequence[Optional[tf.Tensor]], sizes: Sequence[int]
+    ) -> tf.Tensor:
+        flats: List[tf.Tensor] = []
+        for tensor, size in zip(tensors, sizes):
+            if tensor is None:
+                flats.append(tf.zeros((size,), dtype=tf.float32))
+            else:
+                flats.append(tf.reshape(tf.cast(tensor, tf.float32), (-1,)))
+        if not flats:
+            return tf.zeros((0,), dtype=tf.float32)
+        return tf.concat(flats, axis=0)
+
+    def _assign_from_flat(
+        self, flat_tensor: tf.Tensor, variables: Sequence[tf.Variable], sizes: Sequence[int]
+    ):
+        offset = 0
+        for var, size in zip(variables, sizes):
+            next_offset = offset + size
+            slice_tensor = tf.reshape(flat_tensor[offset:next_offset], var.shape)
+            var.assign(tf.cast(slice_tensor, var.dtype))
+            offset = next_offset
+
+    def _run_lbfgs_stage(self, total: TotalEnergy):
+        if not self.cfg.lbfgs_enabled:
+            return
+
+        try:
+            import tensorflow_probability as tfp
+        except ImportError as exc:
+            raise RuntimeError(
+                "启用了 L-BFGS 精调，但当前环境未安装 tensorflow_probability。"
+                "请先安装 tensorflow_probability 再重新运行。"
+            ) from exc
+
+        train_vars = self._collect_trainable_variables()
+        if not train_vars:
+            raise RuntimeError("[lbfgs] 找不到可训练变量，无法执行 L-BFGS 精调。")
+
+        sizes = []
+        for var in train_vars:
+            size = var.shape.num_elements()
+            if size is None:
+                raise ValueError(
+                    f"[lbfgs] 变量 {var.name} 的形状包含未知维度，无法展开为一维向量。"
+                )
+            sizes.append(int(size))
+
+        if self.cfg.lbfgs_reuse_last_batch and self._last_preload_case is not None:
+            lbfgs_case = copy.deepcopy(self._last_preload_case)
+        else:
+            lbfgs_case = self._sample_preload_case()
+
+        lbfgs_params = self._make_preload_params(lbfgs_case)
+        order = lbfgs_case.get("order")
+        if order is None:
+            order_txt = "默认顺序"
+        else:
+            order_txt = "-".join(str(int(i) + 1) for i in order)
+
+        print("[lbfgs] 开始 L-BFGS 精调阶段：")
+        print(
+            f"[lbfgs] 固定预紧力 P={[int(p) for p in lbfgs_case['P']]} N, 顺序={order_txt},"
+            f" 最大迭代 {self.cfg.lbfgs_max_iter}, tol={self.cfg.lbfgs_tolerance}"
+        )
+
+        initial_position = self._flatten_tensor_list(train_vars, sizes)
+
+        def _value_and_gradients(position):
+            self._assign_from_flat(position, train_vars, sizes)
+            with tf.GradientTape() as tape:
+                tape.watch(train_vars)
+                loss, Pi, parts, stats = self._compute_total_loss(
+                    total, lbfgs_params, adaptive=False
+                )
+            grads = tape.gradient(loss, train_vars)
+            grad_vec = self._flatten_tensor_list(grads, sizes)
+            return loss, grad_vec
+
+        results = tfp.optimizer.lbfgs_minimize(
+            value_and_gradients_function=_value_and_gradients,
+            initial_position=initial_position,
+            tolerance=self.cfg.lbfgs_tolerance,
+            max_iterations=self.cfg.lbfgs_max_iter,
+            num_correction_pairs=self.cfg.lbfgs_history_size,
+            parallel_iterations=1,
+            linesearch_max_iterations=max(1, int(self.cfg.lbfgs_line_search)),
+        )
+
+        self._assign_from_flat(results.position, train_vars, sizes)
+
+        status = "converged" if results.converged else "stopped"
+        if results.failed:
+            status = "failed"
+        grad_norm = float(results.gradient_norm.numpy()) if results.gradient_norm is not None else float("nan")
+        print(
+            f"[lbfgs] 完成：状态={status}, iters={int(results.num_iterations.numpy())}, "
+            f"loss={float(results.objective_value.numpy()):.3e}, grad={grad_norm:.3e}"
+        )
 
 
     # ----------------- 训练 -----------------
@@ -1219,6 +1332,7 @@ class Trainer:
                     Pi, parts, stats, grad_norm = self._train_step(total, preload_case)
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
+                    self._last_preload_case = copy.deepcopy(preload_case)
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -1358,6 +1472,9 @@ class Trainer:
 
             # 训练结束：再存一次
             self.ckpt_manager.save(checkpoint_number=self.cfg.max_steps)
+
+        if self.cfg.lbfgs_enabled:
+            self._run_lbfgs_stage(total)
 
         self._visualize_after_training(n_samples=self.cfg.viz_samples_after_train)
 

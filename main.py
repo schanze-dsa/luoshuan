@@ -277,6 +277,114 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
+    cfg.adam_steps = cfg.max_steps
+
+    cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
+    if "grad_clip_norm" in optimizer_cfg:
+        cfg.grad_clip_norm = float(optimizer_cfg["grad_clip_norm"])
+    if "log_every" in optimizer_cfg:
+        cfg.log_every = int(optimizer_cfg["log_every"])
+
+    lbfgs_cfg = optimizer_cfg.get("lbfgs", {}) or {}
+    cfg.lbfgs_enabled = bool(optimizer_cfg.get("lbfgs_enabled", cfg.lbfgs_enabled))
+    if lbfgs_cfg:
+        cfg.lbfgs_enabled = bool(lbfgs_cfg.get("enabled", cfg.lbfgs_enabled))
+        cfg.lbfgs_max_iter = int(lbfgs_cfg.get("max_iter", cfg.lbfgs_max_iter))
+        cfg.lbfgs_tolerance = float(lbfgs_cfg.get("tolerance", cfg.lbfgs_tolerance))
+        cfg.lbfgs_history_size = int(lbfgs_cfg.get("history_size", cfg.lbfgs_history_size))
+        cfg.lbfgs_line_search = int(lbfgs_cfg.get("line_search", cfg.lbfgs_line_search))
+        cfg.lbfgs_reuse_last_batch = bool(
+            lbfgs_cfg.get("reuse_last_batch", cfg.lbfgs_reuse_last_batch)
+        )
+
+    # ===== 预紧分阶段 / 顺序设置 =====
+    staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+
+    # 顶层布尔开关优先，其次是 staging_cfg 内的 enabled
+    use_stages_val = cfg_yaml.get("preload_use_stages", None)
+    if use_stages_val is not None:
+        cfg.preload_use_stages = bool(use_stages_val)
+    if "enabled" in staging_cfg:
+        cfg.preload_use_stages = bool(staging_cfg["enabled"])
+
+    random_order_val = cfg_yaml.get("preload_randomize_order", None)
+    if random_order_val is not None:
+        cfg.preload_randomize_order = bool(random_order_val)
+    if "randomize_order" in staging_cfg:
+        cfg.preload_randomize_order = bool(staging_cfg["randomize_order"])
+
+    if "repeat" in staging_cfg:
+        cfg.preload_sequence_repeat = int(staging_cfg["repeat"])
+    if "shuffle" in staging_cfg:
+        cfg.preload_sequence_shuffle = bool(staging_cfg["shuffle"])
+    if "jitter" in staging_cfg:
+        cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
+
+    relax_top = cfg_yaml.get("preload_rank_relaxation", None)
+    if relax_top is not None:
+        cfg.preload_cfg.rank_relaxation = float(relax_top)
+    if "relaxation" in staging_cfg:
+        cfg.preload_cfg.rank_relaxation = float(staging_cfg["relaxation"])
+
+    seq_overrides = cfg_yaml.get("preload_sequence", None)
+    if seq_overrides:
+        cfg.preload_sequence = list(seq_overrides)
+    seq_from_staging = staging_cfg.get("sequence", None)
+    if seq_from_staging:
+        cfg.preload_sequence = list(seq_from_staging)
+
+    if cfg.preload_sequence:
+        cfg.preload_use_stages = True
+
+    # ===== 损失加权配置（含自适应） =====
+    loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
+    base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}
+    weight_key_map = {
+        "w_int": ("w_int", "E_int"),
+        "w_cn": ("w_cn", "E_cn"),
+        "w_ct": ("w_ct", "E_ct"),
+        "w_tie": ("w_tie", "E_tie"),
+        "w_bc": ("w_bc", "E_bc"),
+        "w_pre": ("w_pre", "W_pre"),
+    }
+    for yaml_key, (attr, _) in weight_key_map.items():
+        if yaml_key in base_weights_yaml:
+            setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
+
+    adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
+    cfg.loss_adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+    cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
+    cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
+    if "min_weight" in adaptive_cfg:
+        cfg.loss_min_factor = float(adaptive_cfg["min_weight"])
+    if "max_weight" in adaptive_cfg:
+        cfg.loss_max_factor = float(adaptive_cfg["max_weight"])
+    temperature = float(adaptive_cfg.get("temperature", 0.0) or 0.0)
+    if temperature > 0.0:
+        cfg.loss_gamma = 1.0 / temperature
+    else:
+        cfg.loss_gamma = float(adaptive_cfg.get("gamma", cfg.loss_gamma))
+
+    focus_terms_yaml = adaptive_cfg.get("focus_terms", []) or []
+    focus_terms = []
+    for item in focus_terms_yaml:
+        key = str(item).strip()
+        mapping = weight_key_map.get(key)
+        if mapping is None:
+            continue
+        focus_terms.append(mapping[1])
+    cfg.loss_focus_terms = tuple(focus_terms)
+    cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
+
+    # 若启用分阶段加载但 focus_terms 未包含 W_pre，则自动加入以增强预紧信号
+    if cfg.preload_use_stages and "W_pre" not in cfg.loss_focus_terms:
+        cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["W_pre"])
+
+    cfg.resample_contact_every = int(
+        cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
+    )
+    cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
+
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
     if "grad_clip_norm" in optimizer_cfg:
@@ -547,7 +655,7 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
 
     # 训练关键配置核对
     print("\n[训练配置核对]")
-    print(f"  - 训练步数 max_steps = {cfg.max_steps}")
+    print(f"  - Adam 阶段步数 = {cfg.max_steps}")
     print(f"  - 接触采样 n_contact_points_per_pair = {cfg.n_contact_points_per_pair}")
     print(f"  - 预紧采样 preload_n_points_each = {cfg.preload_n_points_each}")
     print(f"  - 预紧力范围 N = {cfg.preload_min} ~ {cfg.preload_max}")
@@ -559,6 +667,16 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
         f"  - 接触重采样 resample_contact_every = {cfg.resample_contact_every}"
     )
     print(f"  - ALM 更新周期 alm_update_every = {cfg.alm_update_every}")
+    print(
+        "  - L-BFGS: enabled={}, max_iter={}, tol={}, history={}, line_search={}, reuse_last_batch={}".format(
+            cfg.lbfgs_enabled,
+            cfg.lbfgs_max_iter,
+            cfg.lbfgs_tolerance,
+            cfg.lbfgs_history_size,
+            cfg.lbfgs_line_search,
+            cfg.lbfgs_reuse_last_batch,
+        )
+    )
     print(f"  - 材料库（name -> (E, nu)）：{cfg.materials}")
     print(f"  - Part→材料：{cfg.part2mat}")
     print("======================================================================\n")
