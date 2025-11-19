@@ -577,7 +577,10 @@ class DisplacementModel:
         P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
         z = self.encoder(P_hat)          # (B, cond_dim)
         u = self.field(tf.convert_to_tensor(X), z)   # (N,3)
-        return u
+        # Physics operators和能量算子都假定输入为 float32；若启用混合精度，
+        # 网络内部会在 float16/bfloat16 下计算，此处统一 cast 回 float32，
+        # 以避免如 tie/boundary 约束中出现 "expected float but got half" 的报错。
+        return tf.cast(u, tf.float32)
 
 
 def create_displacement_model(cfg: Optional[ModelConfig] = None) -> DisplacementModel:
