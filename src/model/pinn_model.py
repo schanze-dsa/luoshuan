@@ -225,7 +225,8 @@ class GraphConvLayer(tf.keras.layers.Layer):
     """简单的消息传递层：聚合 kNN 邻居并结合相对坐标统计。"""
 
     def __init__(self, hidden_dim: int, k: int, act: str, dropout: float = 0.0):
-        super().__init__()
+        # 始终在 float32 下计算，避免混合精度下的溢出/NaN
+        super().__init__(dtype=tf.float32)
         self.hidden_dim = hidden_dim
         self.k = max(int(k), 1)
         self.act = _get_activation(act)
@@ -248,21 +249,26 @@ class GraphConvLayer(tf.keras.layers.Layer):
         coords : (N, 3)
         knn_idx: (N, K)
         """
-        neighbors = tf.gather(feat, knn_idx)                 # (N, K, C)
+        input_dtype = feat.dtype
+        feat32 = tf.cast(feat, tf.float32)
+        coords32 = tf.cast(coords, tf.float32)
+
+        neighbors = tf.gather(feat32, knn_idx)               # (N, K, C)
         agg = tf.reduce_mean(neighbors, axis=1)              # (N, C)
 
-        nbr_coords = tf.gather(coords, knn_idx)              # (N, K, 3)
-        rel = nbr_coords - tf.expand_dims(coords, axis=1)    # (N, K, 3)
+        nbr_coords = tf.gather(coords32, knn_idx)            # (N, K, 3)
+        rel = nbr_coords - tf.expand_dims(coords32, axis=1)  # (N, K, 3)
         rel_mean = tf.reduce_mean(rel, axis=1)
         rel_std = tf.math.reduce_std(rel, axis=1)
         rel_feat = tf.concat([rel_mean, rel_std], axis=-1)   # (N, 6)
-        rel_feat = tf.cast(rel_feat, feat.dtype)
 
-        mix = tf.concat([feat, agg, rel_feat], axis=-1)
+        mix = tf.concat([feat32, agg, rel_feat], axis=-1)
         out = self.lin(mix)
         out = self.act(out)
         if self.dropout > 0.0 and training:
             out = tf.nn.dropout(out, rate=self.dropout)
+        if input_dtype != tf.float32:
+            out = tf.cast(out, input_dtype)
         return out
 
 
