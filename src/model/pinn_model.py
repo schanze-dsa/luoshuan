@@ -66,7 +66,6 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
-    graph_max_nodes: int = 4096  # 节点超过该阈值时自动回退到 MLP，防止构图 OOM
 
 @dataclass
 class ModelConfig:
@@ -450,13 +449,7 @@ class DisplacementNet(tf.keras.Model):
             return self.graph_out(hcur)
 
         if self.use_graph:
-            max_nodes = int(getattr(self.cfg, "graph_max_nodes", 0) or 0)
-            if max_nodes > 0:
-                max_nodes_const = tf.constant(max_nodes, dtype=tf.int32)
-                use_graph = tf.less_equal(tf.shape(x)[0], max_nodes_const)
-                u = tf.cond(use_graph, graph_forward, mlp_forward)
-            else:
-                u = graph_forward()
+            u = graph_forward()
         else:
             u = mlp_forward()
         # 在半精度策略下，强制回落到 float32，避免在物理能量项中产生 NaN
