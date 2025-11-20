@@ -465,12 +465,16 @@ class DisplacementNet(tf.keras.Model):
         if z.dtype != feat_dtype:
             z = tf.cast(z, feat_dtype)
         # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
-        N = tf.shape(x)[0]
         B = tf.shape(z)[0]
-        if tf.not_equal(B, 1) and tf.not_equal(B, N):
-            # fallback: repeat first row
-            z = z[:1, :]
-            B = 1
+        N = tf.shape(x)[0]
+
+        # 使用 tf.cond 处理动态逻辑
+        # 如果 (B != 1) 且 (B != N)，则截取 z 的第一行，否则保持 z 不变
+        condition = tf.logical_and(tf.not_equal(B, 1), tf.not_equal(B, N))
+        z = tf.cond(condition, lambda: z[:1], lambda: z)
+        
+        # 重新获取 B，确保形状信息更新
+        B = tf.shape(z)[0]
         if tf.equal(B, 1):
             zb = tf.repeat(z, repeats=N, axis=0)
         else:
