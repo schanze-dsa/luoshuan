@@ -1884,7 +1884,16 @@ class _SavedModelModule(tf.Module):
     def __init__(self, model: DisplacementModel, use_stages: bool,
                  shift: float, scale: float, n_bolts: int):
         super().__init__(name="pinn_saved_model")
+        # 1. 显式追踪子模块 (关键修复)
+        # 将 DisplacementModel 的核心子层挂载到 self 上，确保 TF 能追踪到变量
+        self.encoder = model.encoder
+        self.field = model.field
+        
+        # 2. 保留原始模型的引用 (用于调用 u_fn)
+        # 注意：直接用 self._model.u_fn 可能会导致追踪路径断裂
+        # 我们需要确保 u_fn 使用的 encoder/field 就是上面挂载的这两个
         self._model = model
+
         self._use_stages = bool(use_stages)
         self._shift = tf.constant(shift, dtype=tf.float32)
         self._scale = tf.constant(scale, dtype=tf.float32)
@@ -1898,22 +1907,39 @@ class _SavedModelModule(tf.Module):
         ]
     )
     def run(self, X, P, order):
+        # 准备参数
         params = self._prepare_params(P, order)
+        
+        # 调用模型的前向传播
+        # 由于 self._model.encoder 就是 self.encoder，变量是共享且被追踪的
         return self._model.u_fn(X, params)
 
     def _prepare_params(self, P, order):
+        # 确保 P 是 1D
         P = tf.reshape(P, (self._n_bolts,))
+        
+        # 如果不启用分阶段，直接返回 P
         if not self._use_stages:
             return {"P": P}
+            
+        # 归一化顺序
         order = self._normalize_order(order)
+        
+        # 构建阶段张量 (包含 P_hat 特征)
         stage_P, stage_feat = self._build_stage_tensors(P, order)
+        
+        # 返回最后一个阶段的数据
         return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
 
     def _normalize_order(self, order):
         order = tf.reshape(order, (self._n_bolts,))
         default = tf.range(self._n_bolts, dtype=tf.int32)
+        
+        # 检查是否全部 >= 0
         cond = tf.reduce_all(order >= 0)
         order = tf.where(cond, order, default)
+        
+        # 检查是否需要从 1-based 转 0-based
         minv = tf.reduce_min(order)
         maxv = tf.reduce_max(order)
 
@@ -1931,26 +1957,40 @@ class _SavedModelModule(tf.Module):
         stage_count = self._n_bolts
         cumulative = tf.zeros_like(P)
         mask = tf.zeros_like(P)
+        
+        # 使用 TensorArray 动态构建序列
         loads_ta = tf.TensorArray(tf.float32, size=stage_count)
         masks_ta = tf.TensorArray(tf.float32, size=stage_count)
         last_ta = tf.TensorArray(tf.float32, size=stage_count)
 
         def body(i, cum, mask_vec, loads, masks, lasts):
+            # 获取当前步骤要拧的螺栓索引
             bolt = tf.gather(order, i)
             bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
+            
+            # 获取该螺栓的力
             load_val = tf.gather(P, bolt)
             idx = tf.reshape(bolt, (1, 1))
+            
+            # 更新累积载荷 (cumulative)
             cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
+            
+            # 更新掩码 (mask)
             mask_vec = tf.tensor_scatter_nd_update(
                 mask_vec, idx, tf.ones((1,), dtype=tf.float32)
             )
+            
+            # 记录到 Array
             loads = loads.write(i, cum)
             masks = masks.write(i, mask_vec)
+            
+            # 构建 last_active (当前操作的螺栓)
             last_vec = tf.zeros_like(P)
             last_vec = tf.tensor_scatter_nd_update(
                 last_vec, idx, tf.ones((1,), dtype=tf.float32)
             )
             lasts = lasts.write(i, last_vec)
+            
             return i + 1, cum, mask_vec, loads, masks, lasts
 
         _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
@@ -1963,6 +2003,7 @@ class _SavedModelModule(tf.Module):
         stage_masks = masks_ta.stack()
         stage_last = last_ta.stack()
 
+        # 构建 Rank 矩阵
         indices = tf.reshape(order, (-1, 1))
         ranks = tf.cast(tf.range(stage_count), tf.float32)
         rank_vec = tf.tensor_scatter_nd_update(
@@ -1973,9 +2014,12 @@ class _SavedModelModule(tf.Module):
         else:
             rank_vec = tf.zeros_like(rank_vec)
 
+        # 拼接最终特征 P_hat
         feats_ta = tf.TensorArray(tf.float32, size=stage_count)
         for i in range(stage_count):
+            # 归一化 P
             norm = (stage_P[i] - self._shift) / self._scale
+            # 拼接: [NormP, Mask, Last, Rank]
             feat = tf.concat([norm, stage_masks[i], stage_last[i], rank_vec], axis=0)
             feats_ta = feats_ta.write(i, feat)
 
