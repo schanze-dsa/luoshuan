@@ -175,6 +175,7 @@ class BlankRegionDiagnostics:
     n_boundary_loops: int
     envelope_area: float
     notes: List[str]
+    boundary_loops: List[List[int]]
 
     def summary_lines(self) -> List[str]:
         lines = [
@@ -374,7 +375,34 @@ def _diagnose_blank_regions(
         n_boundary_loops=n_loops,
         envelope_area=envelope_area,
         notes=notes,
+        boundary_loops=boundary_loops,
     )
+
+
+def _mask_tris_with_loops(tri: Triangulation, UV: np.ndarray, loops: List[List[int]]) -> np.ndarray:
+    """Return a mask for triangles outside the outer boundary or inside holes."""
+
+    if not loops:
+        return np.zeros(tri.triangles.shape[0], dtype=bool)
+
+    from matplotlib.path import Path
+
+    areas = [abs(_loop_area(UV, loop)) for loop in loops]
+    if not areas:
+        return np.zeros(tri.triangles.shape[0], dtype=bool)
+
+    outer_idx = int(np.argmax(areas))
+    outer_loop = loops[outer_idx]
+    hole_loops = [loop for i, loop in enumerate(loops) if i != outer_idx]
+
+    centroids = UV[tri.triangles].mean(axis=1)
+    mask = ~Path(UV[outer_loop]).contains_points(centroids)
+
+    for loop in hole_loops:
+        hole_path = Path(UV[loop])
+        mask |= hole_path.contains_points(centroids)
+
+    return mask
 
 
 # -----------------------------
@@ -450,6 +478,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            refine_max_points: Optional[int] = None,
                            eval_batch_size: int = 65_536,
                            diagnose_blanks: bool = False,
+                           auto_fill_blanks: bool = True,
                            diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
     """
     Visualize deflection along the global mirror normal of the given surface.
@@ -479,6 +508,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
         refine_max_points   : Optional guardrail limiting the total evaluation points.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
         diagnose_blanks     : If True, run a one-click diagnosis to pinpoint blank-region causes.
+        auto_fill_blanks    : If True and coverage is low, rebuild a 2D triangulation to fill holes
+                              based on boundary loops (keeps NaN/Inf masking).
         diag_out            : Optional dict to receive ``{"blank_check": BlankRegionDiagnostics}``
                               for downstream logging.
 
@@ -557,6 +588,28 @@ def plot_mirror_deflection(asm: AssemblyModel,
         print("[viz] blank-check primary cause:", diag_result.primary_cause)
         for line in diag_result.summary_lines():
             print("[viz] blank-check", line)
+
+        coverage_threshold = 0.80
+        if auto_fill_blanks and diag_result.coverage_ratio_envelope < coverage_threshold:
+            print(
+                f"[viz] coverage {diag_result.coverage_ratio_envelope:.2%} < {coverage_threshold:.0%}; "
+                "re-triangulating in 2D to improve coverage.",
+            )
+            tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
+            boundary_mask = _mask_tris_with_loops(tri, UV_plot, diag_result.boundary_loops)
+            if np.any(boundary_mask):
+                tri.set_mask(boundary_mask)
+
+            if np.any(nonfinite_mask):
+                invalid_mask = np.any(nonfinite_mask[tri.triangles], axis=1)
+                if np.any(invalid_mask):
+                    tri.set_mask(
+                        invalid_mask if tri.mask is None else (tri.mask | invalid_mask)
+                    )
+
+            tri_plot = tri.triangles.astype(np.int32)
+            tri_mask = tri.mask
+            diag_result.notes.append("applied 2D re-triangulation to fill coverage gaps")
     if diag_out is not None:
         diag_out["blank_check"] = diag_result
 
