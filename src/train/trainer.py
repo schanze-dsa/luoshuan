@@ -184,6 +184,7 @@ class TrainerConfig:
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
     viz_write_data: bool = True             # export displacement samples next to figure
+    viz_write_surface_mesh: bool = True     # export reconstructed FE surface mesh next to figure
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
@@ -1963,6 +1964,12 @@ class Trainer:
             else:
                 resolved_data_path = data_out_path
 
+        resolved_mesh_path: Optional[str]
+        if self.cfg.viz_write_surface_mesh and out_path:
+            resolved_mesh_path = "auto"
+        else:
+            resolved_mesh_path = None
+
         diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
 
         _, _, data_path = plot_mirror_deflection_by_name(
@@ -1978,6 +1985,7 @@ class Trainer:
             symmetric=self.cfg.viz_symmetric,
             show=show,
             data_out_path=resolved_data_path,
+            surface_mesh_out_path=resolved_mesh_path,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
@@ -2006,6 +2014,10 @@ class Trainer:
         if self.cfg.viz_write_data and out_path:
             data_path = os.path.splitext(out_path)[0] + ".txt"
 
+        mesh_path = None
+        if self.cfg.viz_write_surface_mesh and out_path:
+            mesh_path = "auto"
+
         diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
 
         result = plot_mirror_deflection_by_name(
@@ -2020,6 +2032,7 @@ class Trainer:
             levels=self.cfg.viz_levels,
             symmetric=self.cfg.viz_symmetric,
             data_out_path=data_path,
+            surface_mesh_out_path=mesh_path,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
