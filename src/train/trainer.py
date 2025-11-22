@@ -183,15 +183,17 @@ class TrainerConfig:
     viz_symmetric: bool = True              # keep color limits symmetric around 0
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
+    viz_surface_enabled: bool = False       # 是否渲染单一镜面云图
     viz_write_data: bool = True             # export displacement samples next to figure
     viz_write_surface_mesh: bool = True     # export reconstructed FE surface mesh next to figure
-    viz_plot_full_structure: bool = True    # 导出全装配的位移云图
+    viz_plot_full_structure: bool = True    # 导出全装配（或指定零件）的位移云图
+    viz_full_structure_part: Optional[str] = "mirror1"  # None -> 全装配
     viz_write_full_structure_data: bool = False  # 记录全装配位移数据
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
-    viz_diagnose_blanks: bool = True        # 是否在生成云图时自动诊断留白原因
+    viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
     save_best_on: str = "Pi"   # or "E_int"
 
@@ -1988,6 +1990,7 @@ class Trainer:
             params,
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
+            render_surface=self.cfg.viz_surface_enabled,
             title_prefix=title,
             units=self.cfg.viz_units,
             levels=self.cfg.viz_levels,
@@ -1998,6 +2001,7 @@ class Trainer:
             plot_full_structure=full_plot_enabled,
             full_structure_out_path=full_struct_out,
             full_structure_data_out_path=full_struct_data,
+            full_structure_part=self.cfg.viz_full_structure_part,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
@@ -2012,12 +2016,13 @@ class Trainer:
 
         self.last_viz_diag = diag_out.get("blank_check") if diag_out is not None else None
         self.last_viz_data_path = data_path
-        if data_path:
+        if self.cfg.viz_surface_enabled and data_path:
             print(f"[viz] displacement data -> {data_path}")
-        if order_display:
-            print(f"[viz] saved -> {out_path}  (order={order_display})")
-        else:
-            print(f"[viz] saved -> {out_path}")
+        if self.cfg.viz_surface_enabled and out_path:
+            if order_display:
+                print(f"[viz] saved -> {out_path}  (order={order_display})")
+            else:
+                print(f"[viz] saved -> {out_path}")
         return out_path
 
     # ----------------- 可视化（鲁棒多签名） -----------------
@@ -2046,6 +2051,7 @@ class Trainer:
             params,
             P_values=tuple(float(x) for x in P.reshape(-1)),
             out_path=out_path,
+            render_surface=self.cfg.viz_surface_enabled,
             title_prefix=title,
             units=self.cfg.viz_units,
             levels=self.cfg.viz_levels,
@@ -2055,6 +2061,7 @@ class Trainer:
             plot_full_structure=full_plot_enabled,
             full_structure_out_path=full_struct_out,
             full_structure_data_out_path=full_struct_data,
+            full_structure_part=self.cfg.viz_full_structure_part,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
@@ -2095,19 +2102,20 @@ class Trainer:
             params_eval = self._extract_final_stage_params(params_full, keep_context=True)
             try:
                 _, _, data_path = self._call_viz(P, params_eval, save_path, title)
-                if not os.path.exists(save_path):
-                    try:
-                        import matplotlib.pyplot as plt
-                        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-                        plt.close()
-                    except Exception:
-                        pass
-                if order_display:
-                    print(f"[viz] saved -> {save_path}  (order={order_display})")
-                else:
-                    print(f"[viz] saved -> {save_path}")
-                if data_path:
-                    print(f"[viz] displacement data -> {data_path}")
+                if self.cfg.viz_surface_enabled:
+                    if not os.path.exists(save_path):
+                        try:
+                            import matplotlib.pyplot as plt
+                            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+                            plt.close()
+                        except Exception:
+                            pass
+                    if order_display:
+                        print(f"[viz] saved -> {save_path}  (order={order_display})")
+                    else:
+                        print(f"[viz] saved -> {save_path}")
+                    if data_path:
+                        print(f"[viz] displacement data -> {data_path}")
             except TypeError as e:
                 print("[viz] signature mismatch:", e)
             except Exception as e:
