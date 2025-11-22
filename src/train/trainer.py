@@ -188,6 +188,7 @@ class TrainerConfig:
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
+    viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
     viz_diagnose_blanks: bool = True        # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
     save_best_on: str = "Pi"   # or "E_int"
@@ -1992,6 +1993,7 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
             diag_out=diag_out,
@@ -2039,6 +2041,7 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
             diag_out=diag_out,
