@@ -445,6 +445,35 @@ def _unique_nodes_from_tris(ts: TriSurface) -> Tuple[np.ndarray, np.ndarray]:
     return nid_unique, tri_idx
 
 
+def _export_surface_mesh(path: Path,
+                         nid_unique: np.ndarray,
+                         X3D: np.ndarray,
+                         tri_idx: np.ndarray) -> None:
+    """Write the reconstructed FE surface (nodes + triangles) to a PLY file."""
+
+    path = path.with_suffix(path.suffix or ".ply")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8") as fp:
+        fp.write("ply\n")
+        fp.write("format ascii 1.0\n")
+        fp.write("comment reconstructed from INP surface for visualization audit\n")
+        fp.write(f"element vertex {X3D.shape[0]}\n")
+        fp.write("property float x\n")
+        fp.write("property float y\n")
+        fp.write("property float z\n")
+        fp.write("property int node_id\n")
+        fp.write(f"element face {tri_idx.shape[0]}\n")
+        fp.write("property list uchar int vertex_indices\n")
+        fp.write("end_header\n")
+
+        for nid, xyz in zip(nid_unique, X3D):
+            fp.write(f"{xyz[0]:.10f} {xyz[1]:.10f} {xyz[2]:.10f} {int(nid)}\n")
+
+        for tri in tri_idx:
+            fp.write(f"3 {int(tri[0])} {int(tri[1])} {int(tri[2])}\n")
+
+
 def _project_to_plane(X: np.ndarray, c: np.ndarray, e1: np.ndarray, e2: np.ndarray) -> np.ndarray:
     """
     Project 3D points X (N,3) to 2D coords (u,v) in plane basis {e1,e2} at origin c.
@@ -471,6 +500,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            symmetric: bool = True,
                            show: bool = False,
                            data_out_path: Optional[str] = "auto",
+                           surface_mesh_out_path: Optional[str] = "auto",
                            style: str = "smooth",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
@@ -496,6 +526,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
         data_out_path    : Path to write displacement samples. If "auto" and
                            ``out_path`` is provided, a ``.txt`` with the same
                            stem is written. Use ``None``/"none" to disable.
+        surface_mesh_out_path : Path to write the reconstructed FE surface mesh
+                           (triangles only, no displacement). If "auto" and
+                           ``out_path`` is provided, a ``*_surface.ply`` next to
+                           the figure is written. Use ``None``/"none" to disable.
         style            : "smooth" to render a Gouraud-shaded tripcolor map
                            (Abaqus-like), "flat" for flat shading, or
                            "contour" to use tricontourf as in the legacy
@@ -695,6 +729,23 @@ def plot_mirror_deflection(asm: AssemblyModel,
                     f"{u_base[idx, 0]: .8f} {u_base[idx, 1]: .8f} {u_base[idx, 2]: .8f} "
                     f"{d_base[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
                 )
+
+    mesh_path: Optional[Path] = None
+    resolved_mesh = surface_mesh_out_path
+    if isinstance(resolved_mesh, str):
+        mesh_key = resolved_mesh.strip().lower()
+        if mesh_key == "auto":
+            mesh_path = Path(out_path).with_name(Path(out_path).stem + "_surface.ply") if out_path else None
+        elif mesh_key in {"", "none"}:
+            mesh_path = None
+        else:
+            mesh_path = Path(resolved_mesh)
+    elif isinstance(resolved_mesh, Path):
+        mesh_path = resolved_mesh
+
+    if mesh_path is not None:
+        _export_surface_mesh(mesh_path, nid_unique, X3D, tri_idx)
+        print(f"[viz] surface mesh -> {mesh_path}")
 
     if out_path:
         out_path = Path(out_path)
