@@ -103,6 +103,16 @@ def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int
     return np.concatenate(outputs, axis=0)
 
 
+def _with_new_stem(path: Path, new_stem: str) -> Path:
+    """``Path.with_stem`` polyfill for Python <3.9.
+
+    On older Python versions ``WindowsPath``/``PosixPath`` lack ``with_stem``;
+    emulate it by replacing the filename while preserving the suffix and parent.
+    """
+
+    return path.with_name(new_stem + path.suffix)
+
+
 def _eval_surface_or_assembly(
     u_fn,
     params,
@@ -111,6 +121,7 @@ def _eval_surface_or_assembly(
     surface_points: np.ndarray,
     eval_batch_size: int,
     eval_scope: str,
+    eval_subset: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ):
     """Evaluate displacements on the whole assembly, then slice out the surface.
 
@@ -132,12 +143,16 @@ def _eval_surface_or_assembly(
             f"[viz] eval_scope='{scope_key}' 被强制为 'assembly' 以对全结构求解后再切表面"
         )
 
-    # Evaluate over all assembly nodes once, then gather the surface subset.
-    global_nid = np.array(sorted(asm.nodes.keys()), dtype=np.int64)
-    global_xyz = np.stack([asm.nodes[int(n)] for n in global_nid], axis=0).astype(np.float64)
+    if eval_subset is not None:
+        global_nid, global_xyz = eval_subset
+        scope_label = "part"
+    else:
+        global_nid = np.array(sorted(asm.nodes.keys()), dtype=np.int64)
+        global_xyz = np.stack([asm.nodes[int(n)] for n in global_nid], axis=0).astype(np.float64)
+        scope_label = "assembly"
 
     print(
-        f"[viz] eval_scope=assembly -> querying {len(global_nid)} nodes "
+        f"[viz] eval_scope={scope_label} -> querying {len(global_nid)} nodes "
         f"(surface nodes={len(surface_node_ids)})"
     )
 
@@ -544,6 +559,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            params: dict,
                            P_values: Optional[Tuple[float, float, float]] = None,
                            out_path: Optional[str] = None,
+                           render_surface: bool = True,
                            title_prefix: str = "Mirror Deflection",
                            units: str = "mm",
                            levels: int = 24,
@@ -554,6 +570,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            plot_full_structure: bool = False,
                            full_structure_out_path: Optional[str] = "auto",
                            full_structure_data_out_path: Optional[str] = None,
+                           full_structure_part: Optional[str] = None,
                            style: str = "smooth",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
@@ -631,6 +648,19 @@ def plot_mirror_deflection(asm: AssemblyModel,
     # 3) Evaluate displacement and take scalar deflection along normal
     eval_scope_key = (eval_scope or "surface").strip().lower()
 
+    eval_subset = None
+    target_part = full_structure_part or ts.part_name
+    if target_part and getattr(asm, "parts", None):
+        for name, part_obj in asm.parts.items():
+            if target_part.lower() == name.lower():
+                nid_subset = np.array(sorted(part_obj.nodes_xyz.keys()), dtype=np.int64)
+                xyz_subset = (
+                    np.stack([part_obj.nodes_xyz[int(n)] for n in nid_subset], axis=0)
+                    .astype(np.float64)
+                )
+                eval_subset = (nid_subset, xyz_subset)
+                break
+
     u_base, eval_meta = _eval_surface_or_assembly(
         u_fn,
         params,
@@ -639,6 +669,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
         X3D,
         eval_batch_size,
         eval_scope_key,
+        eval_subset=eval_subset,
     )
     eval_scope_info = None
     if eval_meta:
@@ -693,7 +724,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
         tri.set_mask(tri_mask)
 
     diag_result: Optional[BlankRegionDiagnostics] = None
-    if diagnose_blanks:
+    if render_surface and diagnose_blanks:
         diag_result = _diagnose_blank_regions(
             requested_subdiv=int(refine_subdivisions or 0),
             applied_subdiv=applied_subdiv,
@@ -704,16 +735,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
             d_plot=d_plot,
             tri_mask=tri_mask,
         )
-        print("[viz] blank-check primary cause:", diag_result.primary_cause)
-        for line in diag_result.summary_lines():
-            print("[viz] blank-check", line)
 
         coverage_threshold = 0.80
         if auto_fill_blanks and diag_result.coverage_ratio_envelope < coverage_threshold:
-            print(
-                f"[viz] coverage {diag_result.coverage_ratio_envelope:.2%} < {coverage_threshold:.0%}; "
-                "re-triangulating in 2D to improve coverage (holes preserved).",
-            )
             tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
             boundary_mask = _mask_tris_with_loops(tri, UV_plot, diag_result.boundary_loops)
             if np.any(boundary_mask):
@@ -734,50 +758,134 @@ def plot_mirror_deflection(asm: AssemblyModel,
         if eval_scope_info is not None:
             diag_out["eval_scope"] = eval_scope_info
 
-    # 5) Draw
-    fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+    # 5) Draw surface map (optional)
+    fig = ax = None
+    if render_surface:
+        fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
 
-    style_key = (style or "smooth").strip().lower()
-    if style_key not in {"smooth", "flat", "contour"}:
-        style_key = "smooth"
+        style_key = (style or "smooth").strip().lower()
+        if style_key not in {"smooth", "flat", "contour"}:
+            style_key = "smooth"
 
-    default_cmap = "turbo" if style_key in {"smooth", "flat"} else "coolwarm"
-    cmap = cmap or default_cmap
+        default_cmap = "turbo" if style_key in {"smooth", "flat"} else "coolwarm"
+        cmap = cmap or default_cmap
 
-    vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
-    vmin = -vmax if symmetric else float(np.min(d_plot))
+        vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
+        vmin = -vmax if symmetric else float(np.min(d_plot))
 
-    if style_key == "contour":
-        contour_kwargs = {"levels": levels, "cmap": cmap}
-        if symmetric:
-            contour_kwargs.update(vmin=vmin, vmax=vmax)
-        cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
-    else:
-        norm = colors.Normalize(vmin=vmin, vmax=vmax)
-        shading = "gouraud" if style_key == "smooth" else "flat"
-        cs = ax.tripcolor(tri, d_plot, shading=shading, cmap=cmap, norm=norm, edgecolors="none")
+        if style_key == "contour":
+            contour_kwargs = {"levels": levels, "cmap": cmap}
+            if symmetric:
+                contour_kwargs.update(vmin=vmin, vmax=vmax)
+            cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
+        else:
+            norm = colors.Normalize(vmin=vmin, vmax=vmax)
+            shading = "gouraud" if style_key == "smooth" else "flat"
+            cs = ax.tripcolor(
+                tri, d_plot, shading=shading, cmap=cmap, norm=norm, edgecolors="none"
+            )
 
-    if draw_wireframe:
-        ax.triplot(tri, lw=0.35, color="#444444", alpha=0.45)
+        if draw_wireframe:
+            ax.triplot(tri, lw=0.35, color="#444444", alpha=0.45)
 
-    cbar = fig.colorbar(cs, ax=ax, shrink=0.92, pad=0.02)
-    cbar.set_label(f"Deflection along normal [{units}]")
+        cbar = fig.colorbar(cs, ax=ax, shrink=0.92, pad=0.02)
+        cbar.set_label(f"Deflection along normal [{units}]")
 
-    # Aspect & labels
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("u (best-fit plane)")
-    ax.set_ylabel("v (best-fit plane)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("u (best-fit plane)")
+        ax.set_ylabel("v (best-fit plane)")
 
-    # Title with preload values
-    if P_values is None:
-        if isinstance(params, dict) and ("P" in params):
-            P_values = tuple([float(x) for x in np.array(params["P"]).reshape(-1)])
-    if P_values is not None and len(P_values) >= 3:
-        P1, P2, P3 = P_values[0], P_values[1], P_values[2]
-        title = f"{title_prefix}  |  P1={P1:.1f} N, P2={P2:.1f} N, P3={P3:.1f} N"
-    else:
-        title = title_prefix
-    ax.set_title(title)
+        if P_values is None:
+            if isinstance(params, dict) and ("P" in params):
+                P_values = tuple([float(x) for x in np.array(params["P"]).reshape(-1)])
+        if P_values is not None and len(P_values) >= 3:
+            P1, P2, P3 = P_values[0], P_values[1], P_values[2]
+            title = f"{title_prefix}  |  P1={P1:.1f} N, P2={P2:.1f} N, P3={P3:.1f} N"
+        else:
+            title = title_prefix
+        ax.set_title(title)
+
+    # Optional assembly-wide displacement map (scatter)
+    full_plot_path: Optional[Path] = None
+    full_data_path: Optional[Path] = None
+    if plot_full_structure and eval_meta:
+        g_nid = eval_meta.get("global_nodes")
+        g_xyz = eval_meta.get("global_xyz")
+        u_all = eval_meta.get("u_all")
+        if g_nid is not None and g_xyz is not None and u_all is not None:
+            resolved_full = full_structure_out_path
+            if isinstance(resolved_full, str):
+                key = resolved_full.strip().lower()
+                if key == "auto":
+                    resolved_full = (
+                        _with_new_stem(Path(out_path), Path(out_path).stem + "_assembly")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full = None
+                else:
+                    resolved_full = Path(resolved_full)
+            if isinstance(resolved_full, Path):
+                full_plot_path = resolved_full.with_suffix(".png")
+
+            resolved_full_data = full_structure_data_out_path
+            if isinstance(resolved_full_data, str):
+                key = resolved_full_data.strip().lower()
+                if key == "auto":
+                    resolved_full_data = (
+                        _with_new_stem(Path(out_path), Path(out_path).stem + "_assembly").with_suffix(".txt")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full_data = None
+                else:
+                    resolved_full_data = Path(resolved_full_data)
+
+            uv_all = _project_to_plane(g_xyz, c, e1, e2)
+            disp_mag = np.linalg.norm(u_all, axis=1)
+            disp_max = float(np.max(disp_mag)) if disp_mag.size else 0.0
+            norm_full = colors.Normalize(vmin=0.0, vmax=disp_max + 1e-16)
+            fig_full, ax_full = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+            sc = ax_full.scatter(
+                uv_all[:, 0], uv_all[:, 1], c=disp_mag, cmap=cmap, norm=norm_full, s=6.0, alpha=0.9
+            )
+            cbar_full = fig_full.colorbar(sc, ax=ax_full, shrink=0.92, pad=0.02)
+            cbar_full.set_label(f"Displacement magnitude [{units}]")
+            ax_full.set_aspect("equal", adjustable="box")
+            ax_full.set_xlabel("u (best-fit plane)")
+            ax_full.set_ylabel("v (best-fit plane)")
+            title_full = f"{title_prefix}  |  Assembly displacement magnitude"
+            ax_full.set_title(title_full)
+
+            if isinstance(resolved_full, Path):
+                full_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig_full.savefig(full_plot_path, dpi=180)
+                print(f"[viz] assembly displacement -> {full_plot_path}")
+            if isinstance(resolved_full, Path) and show:
+                plt.show()
+            else:
+                plt.close(fig_full)
+
+            if isinstance(resolved_full_data, Path):
+                full_data_path = resolved_full_data
+                full_data_path.parent.mkdir(parents=True, exist_ok=True)
+                header = [
+                    "# Assembly-wide displacement samples exported by plot_mirror_deflection",
+                    f"# units={units} surface={surface_key}",
+                    f"# n_nodes={len(g_nid)}",  # type: ignore[arg-type]
+                    "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane",
+                ]
+                with full_data_path.open("w", encoding="utf-8") as fp:
+                    fp.write("\n".join(header) + "\n")
+                    for idx, nid in enumerate(g_nid):
+                        fp.write(
+                            f"{int(nid):10d} "
+                            f"{g_xyz[idx, 0]: .8f} {g_xyz[idx, 1]: .8f} {g_xyz[idx, 2]: .8f} "
+                            f"{u_all[idx, 0]: .8f} {u_all[idx, 1]: .8f} {u_all[idx, 2]: .8f} "
+                            f"{disp_mag[idx]: .8f} {uv_all[idx, 0]: .8f} {uv_all[idx, 1]: .8f}\n"
+                        )
 
     # Optional assembly-wide displacement map (scatter)
     full_plot_path: Optional[Path] = None
@@ -863,71 +971,75 @@ def plot_mirror_deflection(asm: AssemblyModel,
 
     # Save / show
     data_path: Optional[Path] = None
-    resolved_data = data_out_path
-    if isinstance(resolved_data, str):
-        key = resolved_data.strip().lower()
-        if key == "auto":
-            resolved_data = Path(out_path).with_suffix(".txt") if out_path else None
-        elif key in {"", "none"}:
-            resolved_data = None
-        else:
-            resolved_data = Path(resolved_data)
+    if render_surface:
+        resolved_data = data_out_path
+        if isinstance(resolved_data, str):
+            key = resolved_data.strip().lower()
+            if key == "auto":
+                resolved_data = Path(out_path).with_suffix(".txt") if out_path else None
+            elif key in {"", "none"}:
+                resolved_data = None
+            else:
+                resolved_data = Path(resolved_data)
 
-    if isinstance(resolved_data, Path):
-        data_path = resolved_data
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        header = [
-            "# Mirror deflection samples exported by plot_mirror_deflection",
-            f"# surface={surface_key} units={units}",
-        ]
-        if eval_scope_info is not None:
-            header.append(
-                f"# eval_scope={eval_scope_info['mode']} global_node_count={eval_scope_info['global_node_count']}"
-            )
-        if P_values is not None:
-            header.append(
-                "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
-            )
-        header.append(f"# refine_subdivisions_applied={applied_subdiv}")
-        header.append("# note: exported samples correspond to original FE nodes.")
-        header.append(
-            "# columns: node_id x y z u_x u_y u_z deflection_normal u_plane v_plane"
-        )
-        with data_path.open("w", encoding="utf-8") as fp:
-            fp.write("\n".join(header) + "\n")
-            for idx, nid in enumerate(nid_unique):
-                fp.write(
-                    f"{int(nid):10d} "
-                    f"{X3D[idx, 0]: .8f} {X3D[idx, 1]: .8f} {X3D[idx, 2]: .8f} "
-                    f"{u_base[idx, 0]: .8f} {u_base[idx, 1]: .8f} {u_base[idx, 2]: .8f} "
-                    f"{d_base[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
+        if isinstance(resolved_data, Path):
+            data_path = resolved_data
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            header = [
+                "# Mirror deflection samples exported by plot_mirror_deflection",
+                f"# surface={surface_key} units={units}",
+            ]
+            if eval_scope_info is not None:
+                header.append(
+                    f"# eval_scope={eval_scope_info['mode']} global_node_count={eval_scope_info['global_node_count']}"
                 )
+            if P_values is not None:
+                header.append(
+                    "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
+                )
+            header.append(f"# refine_subdivisions_applied={applied_subdiv}")
+            header.append("# note: exported samples correspond to original FE nodes.")
+            header.append(
+                "# columns: node_id x y z u_x u_y u_z deflection_normal u_plane v_plane"
+            )
+            with data_path.open("w", encoding="utf-8") as fp:
+                fp.write("\n".join(header) + "\n")
+                for idx, nid in enumerate(nid_unique):
+                    fp.write(
+                        f"{int(nid):10d} "
+                        f"{X3D[idx, 0]: .8f} {X3D[idx, 1]: .8f} {X3D[idx, 2]: .8f} "
+                        f"{u_base[idx, 0]: .8f} {u_base[idx, 1]: .8f} {u_base[idx, 2]: .8f} "
+                        f"{d_base[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
+                    )
 
-    mesh_path: Optional[Path] = None
-    resolved_mesh = surface_mesh_out_path
-    if isinstance(resolved_mesh, str):
-        mesh_key = resolved_mesh.strip().lower()
-        if mesh_key == "auto":
-            mesh_path = Path(out_path).with_name(Path(out_path).stem + "_surface.ply") if out_path else None
-        elif mesh_key in {"", "none"}:
-            mesh_path = None
-        else:
-            mesh_path = Path(resolved_mesh)
-    elif isinstance(resolved_mesh, Path):
-        mesh_path = resolved_mesh
+        mesh_path: Optional[Path] = None
+        resolved_mesh = surface_mesh_out_path
+        if isinstance(resolved_mesh, str):
+            mesh_key = resolved_mesh.strip().lower()
+            if mesh_key == "auto":
+                mesh_path = (
+                    Path(out_path).with_name(Path(out_path).stem + "_surface.ply") if out_path else None
+                )
+            elif mesh_key in {"", "none"}:
+                mesh_path = None
+            else:
+                mesh_path = Path(resolved_mesh)
+        elif isinstance(resolved_mesh, Path):
+            mesh_path = resolved_mesh
 
-    if mesh_path is not None:
-        _export_surface_mesh(mesh_path, nid_unique, X3D, tri_idx)
-        print(f"[viz] surface mesh -> {mesh_path}")
+        if mesh_path is not None:
+            _export_surface_mesh(mesh_path, nid_unique, X3D, tri_idx)
+            print(f"[viz] surface mesh -> {mesh_path}")
 
-    if out_path:
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=180)
-    if show:
+        if out_path and fig is not None:
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out_path, dpi=180)
+
+    if show and fig is not None:
         plt.show()
     else:
-        plt.close(fig)
+        plt.close(fig) if fig is not None else None
     return fig, ax, (str(data_path) if data_path is not None else None)
 
 
