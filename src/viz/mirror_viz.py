@@ -103,6 +103,43 @@ def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int
     return np.concatenate(outputs, axis=0)
 
 
+def _eval_surface_or_assembly(
+    u_fn,
+    params,
+    asm: AssemblyModel,
+    surface_node_ids: np.ndarray,
+    surface_points: np.ndarray,
+    eval_batch_size: int,
+    eval_scope: str,
+):
+    """Evaluate displacements either on surface nodes only or on all assembly nodes.
+
+    Returns ``(u_surface, eval_meta)`` where ``u_surface`` aligns with ``surface_points``
+    and ``eval_meta`` optionally carries assembly-wide displacements to reuse.
+    """
+
+    scope_key = (eval_scope or "surface").strip().lower()
+    use_all = scope_key in {"all", "assembly", "global", "full"}
+
+    if not use_all or not getattr(asm, "nodes", None):
+        return _eval_displacement_batched(u_fn, params, surface_points, eval_batch_size), {}
+
+    # Evaluate over all assembly nodes once, then gather the surface subset.
+    global_nid = np.array(sorted(asm.nodes.keys()), dtype=np.int64)
+    global_xyz = np.stack([asm.nodes[int(n)] for n in global_nid], axis=0).astype(np.float64)
+
+    print(
+        f"[viz] eval_scope=assembly -> querying {len(global_nid)} nodes "
+        f"(surface nodes={len(surface_node_ids)})"
+    )
+
+    u_all = _eval_displacement_batched(u_fn, params, global_xyz, eval_batch_size)
+    lookup = {int(n): u_all[i] for i, n in enumerate(global_nid)}
+    u_surface = np.stack([lookup[int(n)] for n in surface_node_ids], axis=0)
+
+    return u_surface, {"global_nodes": global_nid, "u_all": u_all}
+
+
 def _refine_surface_samples(X3D: np.ndarray,
                             UV: np.ndarray,
                             tri_idx: np.ndarray,
@@ -507,6 +544,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            refine_subdivisions: int = 0,
                            refine_max_points: Optional[int] = None,
                            eval_batch_size: int = 65_536,
+                           eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
                            auto_fill_blanks: bool = False,
                            diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
@@ -541,6 +579,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
+        eval_scope          : "surface" 仅对表面节点求位移；"assembly"/"all" 会先对装配中
+                              全部节点求解，再提取对应表面节点的结果（可能更耗时但结果
+                              与全局场保持一致）。
         diagnose_blanks     : If True, run a one-click diagnosis to pinpoint blank-region causes.
         auto_fill_blanks    : If True and coverage is low, rebuild a 2D triangulation to fill holes
                               based on boundary loops (keeps NaN/Inf masking).
@@ -562,7 +603,23 @@ def plot_mirror_deflection(asm: AssemblyModel,
     UV = _project_to_plane(X3D, c, e1, e2)  # (Nu,2)
 
     # 3) Evaluate displacement and take scalar deflection along normal
-    u_base = _eval_displacement_batched(u_fn, params, X3D, eval_batch_size)
+    eval_scope_key = (eval_scope or "surface").strip().lower()
+
+    u_base, eval_meta = _eval_surface_or_assembly(
+        u_fn,
+        params,
+        asm,
+        nid_unique,
+        X3D,
+        eval_batch_size,
+        eval_scope_key,
+    )
+    eval_scope_info = None
+    if eval_meta:
+        eval_scope_info = {
+            "mode": eval_scope_key,
+            "global_node_count": int(eval_meta.get("global_nodes", np.array([])).shape[0]),
+        }
     d_base = u_base @ n  # (Nu,) scalar deflection along global mirror normal
 
     # Optional barycentric refinement for smoother visualization
@@ -646,6 +703,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
             diag_result.notes.append("applied 2D re-triangulation to fill coverage gaps")
     if diag_out is not None:
         diag_out["blank_check"] = diag_result
+        if eval_scope_info is not None:
+            diag_out["eval_scope"] = eval_scope_info
 
     # 5) Draw
     fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
@@ -711,6 +770,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
             "# Mirror deflection samples exported by plot_mirror_deflection",
             f"# surface={surface_key} units={units}",
         ]
+        if eval_scope_info is not None:
+            header.append(
+                f"# eval_scope={eval_scope_info['mode']} global_node_count={eval_scope_info['global_node_count']}"
+            )
         if P_values is not None:
             header.append(
                 "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
