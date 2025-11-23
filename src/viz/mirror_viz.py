@@ -1015,6 +1015,11 @@ def plot_mirror_deflection_by_name(asm: AssemblyModel,
     Example:
         plot_mirror_deflection_by_name(asm, "MIRROR up", u_fn, params, P_values=(300,500,700), out_path="out.png")
     """
+    # 兼容旧版本配置：忽略已移除的参数以防签名报错
+    if "retriangulate_2d" in kwargs:
+        kwargs.pop("retriangulate_2d", None)
+        print("[viz] retriangulate_2d 已弃用，已忽略该参数")
+
     key = None
     low = mirror_surface_bare_name.strip().lower()
     for k, s in asm.surfaces.items():
