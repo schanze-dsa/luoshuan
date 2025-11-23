@@ -767,16 +767,15 @@ def plot_mirror_deflection(asm: AssemblyModel,
     # (Matplotlib will raise if any non-finite values remain inside the
     # triangulation, even when a mask is provided.)
     d_plot_clean = np.array(d_plot, copy=True)
-    d_plot_clean[nonfinite_mask] = 0.0
+    if np.any(nonfinite_mask):
+        d_plot_clean[nonfinite_mask] = 0.0
     if not np.isfinite(d_plot_clean).all():
-        # As an extra guard, zero-out any remaining invalids so contourf/tripcolor
-        # never see NaN/Inf values.
         bad_left = ~np.isfinite(d_plot_clean)
         print(
             f"[viz] Warning: sanitizing {int(bad_left.sum())} residual non-finite "
             "magnitudes before plotting."
         )
-        d_plot_clean[bad_left] = 0.0
+        d_plot_clean = np.nan_to_num(d_plot_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
     # 4) Triangulation in 2D (optionally rebuild to close holes)
     boundary_loops = _collect_boundary_loops(tri_plot)
