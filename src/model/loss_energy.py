@@ -316,7 +316,17 @@ class TotalEnergy:
         prev_parts: Optional[Dict[str, tf.Tensor]] = None
         prev_bolt_deltas: Optional[tf.Tensor] = None
         prev_P: Optional[tf.Tensor] = None
+        prev_slip: Optional[tf.Tensor] = None
+
+        contact_state = None
+        base_contact_state = None
+        if self.contact is not None and hasattr(self.contact, "snapshot_stage_state"):
+            contact_state = self.contact.snapshot_stage_state()
+            base_contact_state = contact_state
         for idx, stage_params in enumerate(stage_seq):
+            if contact_state is not None and hasattr(self.contact, "restore_stage_state"):
+                self.contact.restore_stage_state(contact_state)
+
             stage_parts, stage_stats = self._compute_parts(u_fn, stage_params, tape)
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
@@ -333,20 +343,39 @@ class TotalEnergy:
                 bolt_deltas = tf.cast(pre_entry["bolt_deltas"], dtype)
 
             P_vec = tf.cast(tf.convert_to_tensor(stage_params.get("P", [])), dtype)
+            slip_t = None
+            if self.contact is not None and hasattr(self.contact, "last_friction_slip"):
+                slip_t = self.contact.last_friction_slip()
 
-            if idx > 0 and bolt_deltas is not None and prev_bolt_deltas is not None:
-                disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
+            if idx > 0:
                 load_jump = tf.reduce_sum(tf.abs(P_vec - prev_P)) if prev_P is not None else tf.cast(0.0, dtype)
-                stage_path = disp_jump * load_jump
-                path_penalty = path_penalty + stage_path
-                stats_all[f"s{idx+1}_path_penalty"] = stage_path
+
+                if bolt_deltas is not None and prev_bolt_deltas is not None:
+                    disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
+                    stage_path = disp_jump * load_jump
+                    path_penalty = path_penalty + stage_path
+                    stats_all[f"s{idx+1}_path_penalty"] = stage_path
+
+                if slip_t is not None and prev_slip is not None:
+                    slip_jump = tf.reduce_sum(tf.abs(slip_t - prev_slip))
+                    fric_path = slip_jump * load_jump
+                    path_penalty = path_penalty + fric_path
+                    stats_all[f"s{idx+1}_fric_path_penalty"] = fric_path
 
             if bolt_deltas is not None:
                 prev_bolt_deltas = bolt_deltas
             if tf.size(P_vec) > 0:
                 prev_P = P_vec
+            if slip_t is not None:
+                prev_slip = slip_t
 
             prev_parts = stage_parts
+
+            if contact_state is not None and hasattr(self.contact, "snapshot_stage_state"):
+                contact_state = self.contact.snapshot_stage_state()
+
+        if base_contact_state is not None and hasattr(self.contact, "restore_stage_state"):
+            self.contact.restore_stage_state(base_contact_state)
 
         if isinstance(root_params, dict):
             if "stage_order" in root_params:
