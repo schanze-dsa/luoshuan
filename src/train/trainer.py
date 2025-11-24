@@ -117,7 +117,7 @@ class TrainerConfig:
     bcs: List[Dict[str, Any]] = field(default_factory=list)
 
     # 预紧力范围（N）
-    preload_min: float = 500.0
+    preload_min: float = 0.0
     preload_max: float = 2000.0
     preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
@@ -175,7 +175,7 @@ class TrainerConfig:
     # 输出
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
-    viz_samples_after_train: int = 5
+    viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "contour"             # 默认采用等值填充以获得平滑云图
     viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
@@ -2080,13 +2080,48 @@ class Trainer:
             self.last_viz_diag = diag_out.get("blank_check")
         return result
 
+    def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:
+        """生成固定的 6 组预紧案例以避免可视化阶段的随机性."""
+
+        nb = 3  # 现有镜面配置假定三颗螺栓
+
+        def _make_case(P_list: Sequence[float], order: Sequence[int]) -> Dict[str, np.ndarray]:
+            P_arr = np.asarray(P_list, dtype=np.float32).reshape(-1)
+            if P_arr.size != nb:
+                raise ValueError(f"固定可视化仅支持 {nb} 颗螺栓，收到 {P_arr.size} 维载荷。")
+            case: Dict[str, np.ndarray] = {"P": P_arr}
+            if not self.cfg.preload_use_stages:
+                return case
+            order_norm = self._normalize_order(order, nb)
+            if order_norm is None:
+                return case
+            case["order"] = order_norm
+            case.update(self._build_stage_case(P_arr, order_norm))
+            return case
+
+        cases: List[Dict[str, np.ndarray]] = []
+
+        # 三组单螺栓 2000N，顺序固定为 1-2-3
+        for P_single in ([2000.0, 0.0, 0.0], [0.0, 2000.0, 0.0], [0.0, 0.0, 2000.0]):
+            cases.append(_make_case(P_single, order=[0, 1, 2]))
+
+        # 三组 1500N 等幅，采用不同拧紧顺序
+        for order in ([0, 1, 2], [0, 2, 1], [2, 1, 0]):
+            cases.append(_make_case([1500.0, 1500.0, 1500.0], order=order))
+
+        return cases
+
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
             return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        print(f"[trainer] Generating {n_samples} deflection maps for '{self.cfg.mirror_surface_name}' ...")
-        for i in range(n_samples):
-            preload_case = self._sample_preload_case()
+        cases = self._fixed_viz_preload_cases()
+        n_total = len(cases) if cases else n_samples
+        print(
+            f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
+        )
+        iter_cases = cases if cases else [self._sample_preload_case() for _ in range(n_samples)]
+        for i, preload_case in enumerate(iter_cases):
             P = preload_case["P"]
             order_display = None
             if self.cfg.preload_use_stages and "order" in preload_case:
