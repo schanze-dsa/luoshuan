@@ -105,14 +105,27 @@ class TotalEnergy:
         self.preload: Optional[PreloadWork] = None
 
         # trainable (non) scalars as TF vars so they can be scheduled
-        self.w_int = tf.Variable(self.cfg.w_int, dtype=self.dtype, trainable=False, name="w_int")
-        self.w_cn  = tf.Variable(self.cfg.w_cn,  dtype=self.dtype, trainable=False, name="w_cn")
-        self.w_ct  = tf.Variable(self.cfg.w_ct,  dtype=self.dtype, trainable=False, name="w_ct")
-        self.w_tie = tf.Variable(self.cfg.w_tie, dtype=self.dtype, trainable=False, name="w_tie")
-        self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
-        self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
+        self._ensure_weight_vars()
 
         self._built = False
+
+    def _ensure_weight_vars(self):
+        """确保权重变量已创建；兼容旧 checkpoint/对象缺少新字段的场景。"""
+
+        if not hasattr(self, "w_int"):
+            self.w_int = tf.Variable(self.cfg.w_int, dtype=self.dtype, trainable=False, name="w_int")
+        if not hasattr(self, "w_cn"):
+            self.w_cn = tf.Variable(self.cfg.w_cn, dtype=self.dtype, trainable=False, name="w_cn")
+        if not hasattr(self, "w_ct"):
+            self.w_ct = tf.Variable(self.cfg.w_ct, dtype=self.dtype, trainable=False, name="w_ct")
+        if not hasattr(self, "w_tie"):
+            self.w_tie = tf.Variable(self.cfg.w_tie, dtype=self.dtype, trainable=False, name="w_tie")
+        if not hasattr(self, "w_bc"):
+            self.w_bc = tf.Variable(self.cfg.w_bc, dtype=self.dtype, trainable=False, name="w_bc")
+        if not hasattr(self, "w_pre"):
+            self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
+        if not hasattr(self, "w_sigma"):
+            self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
 
     # ---------- wiring ----------
 
@@ -172,6 +185,8 @@ class TotalEnergy:
         energy is evaluated incrementally for each stage and accumulated so that
         different tightening orders can influence the loss.
         """
+        # 某些情况下（例如加载旧 checkpoint 构造的对象）可能缺少新增的权重变量，这里兜底创建。
+        self._ensure_weight_vars()
         if not self._built:
             raise RuntimeError("[TotalEnergy] attach(...) must be called before energy().")
 
