@@ -282,6 +282,9 @@ class FrictionContactALM:
         if self.normal_op is None:
             raise RuntimeError("FrictionContactALM needs link_normal(normal_op) before use.")
 
+        if hasattr(self.normal_op, "effective_normal_pressure"):
+            return tf.cast(self.normal_op.effective_normal_pressure(u_fn, params), self.dtype)
+
         g = self.normal_op._gap(u_fn, params)                      # (N,)
         phi = softplus_neg(g, self.normal_op.beta)                 # (N,)
         p_eff = self.normal_op.lmbda + self.normal_op.mu_n * phi   # (N,)
