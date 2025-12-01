@@ -142,7 +142,7 @@ class TrainerConfig:
     # 物理项/模型配置
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
     elas_cfg: ElasticityConfig = field(
-        default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=1024, use_pfor=False)
+        default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=0, use_pfor=False)
     )
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     preload_cfg: PreloadConfig = field(default_factory=PreloadConfig)
