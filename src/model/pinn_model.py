@@ -197,8 +197,6 @@ class MLP(tf.keras.layers.Layer):
         depth: int,
         act: str,
         final_dim: Optional[int] = None,
-        w0: float = 30.0,
-        siren: bool = False,
         dtype: Optional[tf.dtypes.DType] = None,
     ):
         super().__init__()
@@ -206,15 +204,13 @@ class MLP(tf.keras.layers.Layer):
         self.depth = depth
         self.act = _get_activation(act)
         self.final_dim = final_dim
-        self.siren = siren
-        self.w0 = w0
         self._dense_dtype = dtype
 
         self.layers_dense = []
         for i in range(depth):
             dense_kwargs = {
                 "units": width,
-                "kernel_initializer": self._kernel_init(i),
+                "kernel_initializer": "he_uniform",
             }
             if self._dense_dtype is not None:
                 dense_kwargs["dtype"] = self._dense_dtype
@@ -230,33 +226,11 @@ class MLP(tf.keras.layers.Layer):
         else:
             self.final_dense = None
 
-    def _kernel_init(self, layer_idx: int):
-        if self.siren:
-            # SIREN initialization (Sitzmann et al.)
-            def siren_init(shape, dtype=None):
-                in_dim = shape[0]
-                if layer_idx == 0:
-                    scale = 1.0 / in_dim
-                else:
-                    scale = tf.sqrt(6.0 / in_dim) / self.w0
-                return tf.random.uniform(shape, minval=-scale, maxval=scale, dtype=dtype)
-            return siren_init
-        # default
-        return "he_uniform"
-
     def call(self, x: tf.Tensor) -> tf.Tensor:
         y = x
-        if self.siren:
-            # first layer with w0 scaling
-            y = self.layers_dense[0](y)
-            y = tf.sin(self.w0 * y)
-            for i in range(1, self.depth):
-                y = self.layers_dense[i](y)
-                y = tf.sin(y)
-        else:
-            for i in range(self.depth):
-                y = self.layers_dense[i](y)
-                y = self.act(y)
+        for i in range(self.depth):
+            y = self.layers_dense[i](y)
+            y = self.act(y)
         if self.final_dense is not None:
             y = self.final_dense(y)
         return y
