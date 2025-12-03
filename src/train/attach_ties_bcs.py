@@ -460,6 +460,27 @@ def _parse_boundary_entry(raw_entry: Any) -> Dict[str, Any]:
     return {"set": setn, "type": typ, "dof1": d1, "dof2": d2, "raw": raw}
 
 
+def _boundary_mask(d1: Optional[int], d2: Optional[int], kind: str, N: int) -> np.ndarray:
+    """Generate a (N,3) mask for constrained DOFs."""
+
+    mask = np.zeros((N, 3), dtype=np.float32)
+    kind_upper = kind.upper()
+    if kind_upper == "ENCASTRE":
+        mask.fill(1.0)
+        return mask
+
+    if d1 is None:
+        return mask
+
+    d1 = int(d1)
+    d2 = int(d2) if d2 is not None else d1
+    for dof in range(min(d1, d2), max(d1, d2) + 1):
+        if 1 <= dof <= 3:
+            mask[:, dof - 1] = 1.0
+
+    return mask
+
+
 def _extract_bcs_from_asm(asm) -> List[Dict[str, Any]]:
     """抽取已解析的边界条件，兼容 asm.boundaries / asm.bcs。"""
     bcs_cfg: List[Dict[str, Any]] = []
@@ -610,18 +631,16 @@ def attach_ties_and_bcs_from_inp(total, asm, cfg) -> None:
         d1 = b.get("dof1")
         d2 = b.get("dof2") if b.get("dof2") is not None else d1
 
-        X, _ = get_nset_coords(asm, setn)
+        X, w = get_nset_coords(asm, setn)
         if isinstance(X, (list, tuple, np.ndarray, dict)):
             X = _as_array3(X) if len(np.asarray(X).shape) != 0 else X  # ★ 兜底
 
         if BoundaryPenalty is not None and isinstance(X, np.ndarray) and X.shape[0] > 0:
             try:
                 bc_cfg = BoundaryConfig(alpha=bc_alpha, mode=bc_mode, mu=bc_mu)
-                bc = BoundaryPenalty(cfg=bc_cfg, dof1=d1, dof2=d2, kind=typ)
-                if hasattr(bc, "build"):
-                    bc.build(X)
-                else:
-                    bc.X = X; bc.dof1 = d1; bc.dof2 = d2; bc.kind = typ
+                bc = BoundaryPenalty(cfg=bc_cfg)
+                mask = _boundary_mask(d1, d2, typ, X.shape[0])
+                bc.build_from_numpy(X, mask, u_target=None, w_bc=w)
                 bcs_out.append(bc)
                 continue
             except Exception:
