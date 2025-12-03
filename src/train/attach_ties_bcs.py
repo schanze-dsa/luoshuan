@@ -2,6 +2,8 @@
 """
 attach_ties_bcs.py — 挂载 Tie / Boundary（优先复用已解析的 asm 对象，Py38+）
 
+注意：本模块不再二次打开 .inp 文件，Tie/Boundary 信息完全依赖 asm 上游解析结果，防止重复 I/O 和正则扫描。
+
 功能层次（按优先级）：
 1) 原生路径：若工程存在 TiePenalty/BoundaryPenalty，且 asm 暴露
    get_triangulated_surface / project_points_onto_surface / get_nset_node_ids / get_node_coords，
