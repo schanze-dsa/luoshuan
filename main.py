@@ -195,6 +195,12 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
+    output_cfg = cfg_yaml.get("output_config", {}) or {}
+    cfg.viz_use_shape_function_interp = bool(
+        output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
+    )
+    if "viz_refine_subdivisions" in output_cfg:
+        cfg.viz_refine_subdivisions = int(output_cfg["viz_refine_subdivisions"])
     cfg.adam_steps = cfg.max_steps
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
