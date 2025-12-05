@@ -15,6 +15,7 @@ import sys
 import time
 import copy
 from dataclasses import dataclass, field
+import inspect
 from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
 
 import numpy as np
@@ -1580,13 +1581,22 @@ class Trainer:
         # 5) 计算/裁剪梯度范数
         non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
         g_list, v_list = zip(*non_none)
-        grad_norm = tf.linalg.global_norm(g_list)
+        grad_norm = self._safe_global_norm(g_list)
 
         clip_norm = getattr(self, "clip_grad_norm", None) or getattr(self.cfg, "clip_grad_norm", None)
         if clip_norm is not None and float(clip_norm) > 0.0:
-            g_list, _ = tf.clip_by_global_norm(g_list, clip_norm)
+            g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
 
-        opt.apply_gradients(zip(g_list, v_list))
+        apply_kwargs = {}
+        try:
+            sig = inspect.signature(opt.apply_gradients)
+            if "experimental_aggregate_gradients" in sig.parameters:
+                apply_kwargs["experimental_aggregate_gradients"] = False
+        except (TypeError, ValueError):
+            # 如果优化器未公开签名或 apply_gradients 被包装，则回退默认行为
+            apply_kwargs = {}
+
+        opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
 
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
@@ -1602,6 +1612,47 @@ class Trainer:
         if not flats:
             return tf.zeros((0,), dtype=tf.float32)
         return tf.concat(flats, axis=0)
+
+    def _safe_global_norm(self, grads: Sequence[tf.Tensor]) -> tf.Tensor:
+        """Compute global norm without densifying IndexedSlices."""
+
+        def _squared_norm(g: tf.Tensor) -> tf.Tensor:
+            if isinstance(g, tf.IndexedSlices):
+                values = tf.cast(g.values, tf.float32)
+                return tf.reduce_sum(tf.square(values))
+            values = tf.cast(g, tf.float32)
+            return tf.reduce_sum(tf.square(values))
+
+        squared = [_squared_norm(g) for g in grads]
+        if not squared:
+            return tf.constant(0.0, dtype=tf.float32)
+        return tf.sqrt(tf.add_n(squared))
+
+    def _safe_clip_by_global_norm(
+        self, grads: Sequence[tf.Tensor], clip_norm: float, global_norm: tf.Tensor
+    ) -> List[tf.Tensor]:
+        """
+        Clip gradients using a precomputed global norm while keeping IndexedSlices sparse.
+
+        The default `tf.clip_by_global_norm` densifies IndexedSlices, triggering warnings
+        and potential memory spikes. Here we rescale the gradient values directly.
+        """
+
+        clip_norm = tf.cast(clip_norm, tf.float32)
+        global_norm = tf.cast(global_norm, tf.float32)
+        # Avoid division by zero
+        safe_norm = tf.maximum(global_norm, tf.constant(1e-12, dtype=tf.float32))
+        scale = tf.minimum(1.0, clip_norm / safe_norm)
+
+        clipped: List[tf.Tensor] = []
+        for g in grads:
+            if isinstance(g, tf.IndexedSlices):
+                clipped.append(
+                    tf.IndexedSlices(g.values * scale, g.indices, g.dense_shape)
+                )
+            else:
+                clipped.append(g * scale)
+        return clipped
 
     def _assign_from_flat(
         self, flat_tensor: tf.Tensor, variables: Sequence[tf.Variable], sizes: Sequence[int]
