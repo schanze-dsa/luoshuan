@@ -661,6 +661,9 @@ class DisplacementModel:
             print(f"[pinn_model] Adjust cond_dim from {cfg.field.cond_dim} -> {cfg.encoder.out_dim}")
             cfg.field.cond_dim = cfg.encoder.out_dim
         self.field = DisplacementNet(cfg.field)
+        # Alias stress head for backward compatibility with previously traced graphs
+        # that referenced `self.stress_out` directly.
+        self.stress_out = self.field.stress_out
 
     def _normalize_inputs(self, X: tf.Tensor, params: Optional[Dict]) -> Tuple[tf.Tensor, tf.Tensor]:
         """Validate/convert inputs and ensure stable shapes for tf.function trace reuse."""
@@ -729,7 +732,7 @@ class DisplacementModel:
         ),
     )
     def _us_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        if self.stress_out is None:
+        if self.field.stress_out is None:
             raise ValueError("stress head disabled (stress_out_dim<=0)")
         z = self.encoder(P_hat)          # (B, cond_dim)
         u, sigma = self.field(X, z, return_stress=True)
