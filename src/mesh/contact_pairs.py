@@ -270,6 +270,13 @@ def guess_surface_key(asm: AssemblyModel, bare_name: str) -> Optional[str]:
     target_cs = bare_name.strip()
     target = target_cs.lower()
 
+    # - 若用户给的是裸的几何名，优先尝试自动补成 ABAQUS 的 key 形式 ASM::"<name>"
+    #   这样不会把包含相同片段的其他面误判成冲突（例如 “bolt3 mirror up”）。
+    if "::" not in target_cs:
+        asm_key_cs = f'ASM::"{target_cs}"'
+        if asm_key_cs in asm.surfaces:
+            return asm_key_cs
+
     # 0) 完全大小写敏感匹配（优先用用户提供的精确写法）
     cs_exact = [k for k, s in asm.surfaces.items()
                 if s.name.strip() == target_cs or k.strip() == target_cs]
