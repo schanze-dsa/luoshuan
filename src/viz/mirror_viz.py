@@ -1034,10 +1034,45 @@ def plot_mirror_deflection(asm: AssemblyModel,
         vmin = -vmax if symmetric else float(np.min(d_plot))
 
         if style_key == "contour":
-            contour_kwargs = {"levels": levels, "cmap": cmap}
-            if symmetric:
-                contour_kwargs.update(vmin=vmin, vmax=vmax)
-            cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
+            # -------------------------------------------------------
+            # 高级光滑处理：使用 griddata 进行二次插值与孔洞修复
+            # -------------------------------------------------------
+            from scipy.interpolate import griddata
+
+            resolution = 1000
+            xi = np.linspace(UV_plot[:, 0].min(), UV_plot[:, 0].max(), resolution)
+            yi = np.linspace(UV_plot[:, 1].min(), UV_plot[:, 1].max(), resolution)
+            Xi, Yi = np.meshgrid(xi, yi)
+
+            print(f"[viz] Running cubic interpolation on {resolution}x{resolution} grid...")
+            Zi = griddata((UV_plot[:, 0], UV_plot[:, 1]), d_plot, (Xi, Yi), method="cubic")
+
+            mask_nan = np.isnan(Zi)
+            if np.any(mask_nan):
+                Zi_fill = griddata((UV_plot[:, 0], UV_plot[:, 1]), d_plot, (Xi, Yi), method="nearest")
+                Zi[mask_nan] = Zi_fill[mask_nan]
+
+            center_x, center_y = np.mean(UV_plot[:, 0]), np.mean(UV_plot[:, 1])
+            R_grid = np.sqrt((Xi - center_x) ** 2 + (Yi - center_y) ** 2)
+
+            r_points = np.sqrt((UV_plot[:, 0] - center_x) ** 2 + (UV_plot[:, 1] - center_y) ** 2)
+            r_inner = np.min(r_points) * 1.02
+            r_outer = np.max(r_points) * 0.98
+
+            Zi[R_grid < r_inner] = np.nan
+            Zi[R_grid > r_outer] = np.nan
+
+            im = ax.imshow(
+                Zi,
+                origin="lower",
+                extent=[xi.min(), xi.max(), yi.min(), yi.max()],
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="bicubic",
+            )
+
+            cs = im
         else:
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
             shading = "gouraud" if style_key == "smooth" else "flat"

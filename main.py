@@ -199,6 +199,8 @@ def _prepare_config_with_autoguess():
     cfg.viz_use_shape_function_interp = bool(
         output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
     )
+    if "viz_surface_source" in output_cfg:
+        cfg.viz_surface_source = str(output_cfg["viz_surface_source"])
     if "viz_refine_subdivisions" in output_cfg:
         cfg.viz_refine_subdivisions = int(output_cfg["viz_refine_subdivisions"])
     cfg.adam_steps = cfg.max_steps
