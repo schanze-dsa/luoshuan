@@ -15,6 +15,7 @@ import sys
 import time
 import copy
 from dataclasses import dataclass, field
+import inspect
 from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
 
 import numpy as np
@@ -1586,7 +1587,16 @@ class Trainer:
         if clip_norm is not None and float(clip_norm) > 0.0:
             g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
 
-        opt.apply_gradients(zip(g_list, v_list))
+        apply_kwargs = {}
+        try:
+            sig = inspect.signature(opt.apply_gradients)
+            if "experimental_aggregate_gradients" in sig.parameters:
+                apply_kwargs["experimental_aggregate_gradients"] = False
+        except (TypeError, ValueError):
+            # 如果优化器未公开签名或 apply_gradients 被包装，则回退默认行为
+            apply_kwargs = {}
+
+        opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
 
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
