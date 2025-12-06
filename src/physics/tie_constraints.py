@@ -43,7 +43,9 @@ import tensorflow as tf
 
 @dataclass
 class TieConfig:
-    alpha: float = 1.0e3      # penalty stiffness for tie (make it large to emulate hard constraint)
+    alpha: float = 1.0e3      # penalty stiffness for tie
+    mode: str = "alm"         # 'alm' | 'penalty' - 使用ALM避免高罚系数
+    mu: float = 1.0e3         # ALM增广系数（mode='alm'时生效）
     dtype: str = "float32"
 
 
@@ -90,6 +92,8 @@ class TiePenalty:
         self.w: Optional[tf.Tensor] = None        # (N,)
         self.mask: Optional[tf.Tensor] = None     # (N,3) 0/1
         self.alpha = tf.Variable(self.cfg.alpha, dtype=self.dtype, trainable=False, name="alpha_tie")
+        self.mu = tf.Variable(self.cfg.mu, dtype=self.dtype, trainable=False, name="mu_tie")
+        self.lmbda: Optional[tf.Variable] = None  # (N,3) ALM乘子
 
         self._N = 0
 
@@ -159,8 +163,9 @@ class TiePenalty:
 
     def energy(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
         """
-        Compute tie penalty energy:
-            E_tie = 0.5 * alpha * Σ w * || M ⊙ [ (xs+u(xs)) - (xm+u(xm)) ] ||^2
+        Compute tie penalty energy with ALM support:
+            - penalty: E_tie = 0.5 * alpha * Σ w * || r ||^2
+            - alm:     E_tie = Σ w * (λ·r + 0.5·μ·||r||²)
         """
         if self.xs is None or self.xm is None or self.w is None or self.mask is None:
             raise RuntimeError("[TiePenalty] build_from_numpy must be called first.")
@@ -169,7 +174,21 @@ class TiePenalty:
         um = u_fn(self.xm, params)                          # (N,3)
         r = ((self.xs + us) - (self.xm + um)) * self.mask   # (N,3)
         r2 = tf.reduce_sum(r * r, axis=1)                   # (N,)
-        E_tie = 0.5 * self.alpha * tf.reduce_sum(self.w * r2)
+        
+        mode = (self.cfg.mode or "penalty").lower()
+        if mode == "alm":
+            # ALM formulation: λ·r + 0.5·μ·r²
+            if self.lmbda is None:
+                self.lmbda = tf.Variable(
+                    tf.zeros_like(self.mask), trainable=False, name="lambda_tie"
+                )
+            lmbda = tf.cast(self.lmbda, self.dtype)
+            mu = tf.cast(self.mu, self.dtype)
+            # Element-wise: lmbda * r (N,3), sum over DOF and samples
+            E_tie = tf.reduce_sum(self.w[:, None] * (lmbda * r + 0.5 * mu * r * r))
+        else:
+            # Pure penalty
+            E_tie = 0.5 * self.alpha * tf.reduce_sum(self.w * r2)
 
         # stats
         abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))
@@ -178,6 +197,23 @@ class TiePenalty:
             "tie_max": tf.reduce_max(abs_r),
         }
         return E_tie, stats
+
+    def update_multipliers(self, u_fn, params=None):
+        """ALM外层更新：λ ← λ + μ·r，仅在mode='alm'时启用。"""
+        if (self.cfg.mode or "penalty").lower() != "alm":
+            return
+        if self.xs is None or self.xm is None or self.mask is None:
+            return
+        if self.lmbda is None:
+            self.lmbda = tf.Variable(
+                tf.zeros_like(self.mask), trainable=False, name="lambda_tie"
+            )
+        
+        us = u_fn(self.xs, params)
+        um = u_fn(self.xm, params)
+        r = ((self.xs + us) - (self.xm + um)) * self.mask
+        mu = tf.cast(self.mu, r.dtype)
+        self.lmbda.assign_add(mu * r)
 
     # ---------- setters ----------
 
