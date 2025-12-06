@@ -193,7 +193,9 @@ class TrainerConfig:
     viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "smooth"              # 默认使用 Gouraud 平滑着色
-    viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
+    viz_colormap: str = "turbo"
+    viz_diagnose_blanks: bool = False      # 是否诊断可视化中的空白区域
+    viz_auto_fill_blanks: bool = False     # 是否尝试自动填充空白区域             # Abaqus-like rainbow palette
     viz_levels: int = 64                    # 等值线数量，提升平滑度（仅 contour 模式）
     viz_symmetric: bool = False             # displacement magnitude is nonnegative
     viz_units: str = "mm"

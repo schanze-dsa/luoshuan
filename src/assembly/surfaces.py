@@ -186,18 +186,48 @@ def _element_surface_to_points(
                 expanded_items.append(ElementFaceRef(int(eid), int(face_id)))
         elif isinstance(it, (tuple, list)) and len(it) == 2 and isinstance(it[0], str) and isinstance(it[1], str):
             # 处理 INP 风格 (elset_name, 'S2')
-            elset_name = it[0].strip("\"' ").strip()  # 去引号和空格
+            # 注意：INP中的surface定义可能是 ("_MIRROR up", "S1")
+            # 但实际的ELSET名称是 "_MIRROR up_S1"（带面号后缀）
+            elset_base = it[0].strip('"' + "'" + " ").strip()  # 去引号和空格
             face_str = it[1].upper()
             if face_str.startswith('S'):
                 try:
                     face_id = int(face_str[1:])
                 except ValueError:
                     raise ValueError(f"[surfaces] 无效的面标识: {face_str} in item={it}")
+                
                 if res.expand_elset is None:
                     raise TypeError(
-                        f"[surfaces] items 包含 elset 引用 ({elset_name}), 但未提供 expand_elset 回调。"
+                        f"[surfaces] items 包含 elset 引用 ({elset_base}), 但未提供 expand_elset 回调。"
                     )
-                elem_ids = list(res.expand_elset(elset_name))
+                
+                # 尝试多种ELSET名称格式:
+                # 1. elset_base + "_" + face_str (e.g., "_MIRROR up_S1")
+                # 2. elset_base (原始名称)
+                # 3. 带引号的变体
+                candidate_names = [
+                    f"{elset_base}_{face_str}",           # _MIRROR up_S1
+                    f'"{elset_base}_{face_str}"',         # "_MIRROR up_S1"
+                    elset_base,                           # _MIRROR up
+                    f'"{elset_base}"',                    # "_MIRROR up"
+                ]
+                
+                elem_ids = None
+                for candidate in candidate_names:
+                    try:
+                        elem_ids = list(res.expand_elset(candidate))
+                        if elem_ids:
+                            _debug(f"[DEBUG] Found ELSET '{candidate}' for item {it}")
+                            break
+                    except (KeyError, Exception):
+                        continue
+                
+                if elem_ids is None or len(elem_ids) == 0:
+                    raise KeyError(
+                        f"[surfaces] 找不到ELSET: 尝试过 {candidate_names}。"
+                        f"请检查INP文件中的ELSET定义。"
+                    )
+                
                 for eid in elem_ids:
                     expanded_items.append(ElementFaceRef(int(eid), face_id))
             else:

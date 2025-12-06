@@ -201,7 +201,7 @@ optimizer_config:
   learning_rate: 0.0005
   grad_clip_norm: 1.0e6
   batch_size: 32
-  epochs: 1000              # Adam 阶段的迭代步数
+  epochs: 1              # Adam 阶段的迭代步数
   lbfgs:
     enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
     max_iter: 200           # L-BFGS 最大迭代次数
@@ -253,9 +253,12 @@ output_config:
   save_path: './results'
   visualize: true
   viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
-  viz_surface_source: "surface"         # 使用 INP 提供的单层镜面
-  viz_refine_subdivisions: 2            # 细分 2 层已足够，后续由 griddata 提升分辨率
-
+  viz_surface_source: "surface"         # 使用INP定义的MIRROR up表面（已修复，完整10648三角形）
+  viz_refine_subdivisions: 2            # 细分以平滑
+  viz_diagnose_blanks: true             # 启用空白诊断
+  viz_auto_fill_blanks: true            # 自动填充小空洞
+  viz_draw_wireframe: false             # 不显示网格线
+  viz_write_surface_mesh: true
 # ------------------------------------------------------------
 # 9. INP 文件路径
 # ------------------------------------------------------------
@@ -272,4 +275,3 @@ alm_update_every: 75               # 接触 ALM 罚乘子更新周期
 
 n_tie_points: 2000
 tie_alpha: 1e3
-bc_alpha: 1e4

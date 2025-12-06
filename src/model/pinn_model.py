@@ -258,12 +258,14 @@ class GraphConvLayer(tf.keras.layers.Layer):
         feat: tf.Tensor,
         coords: tf.Tensor,
         knn_idx: tf.Tensor,
+        adj: tf.sparse.SparseTensor | None = None,
         training: bool | None = False,
     ) -> tf.Tensor:
         """
         feat   : (N, C)
         coords : (N, 3)
         knn_idx: (N, K)
+        adj    : (N, N) Normalized SparseTensor (Optional, preferred for memory efficiency)
         """
         input_dtype = feat.dtype
         feat = tf.ensure_shape(feat, (None, self.hidden_dim))
@@ -271,16 +273,54 @@ class GraphConvLayer(tf.keras.layers.Layer):
         coords = tf.ensure_shape(coords, (None, 3))
         knn_idx = tf.ensure_shape(knn_idx, (None, self.k))
 
-        neighbors = tf.gather(feat, knn_idx)  # (N, K, C)
-        neighbors.set_shape([None, self.k, self.hidden_dim])
-        agg = tf.reduce_mean(neighbors, axis=1)  # (N, C)
+        # --- Optimization: Use Sparse MatMul if adj provided ---
+        if adj is not None:
+             # adj scale is 1/k, so matmul performs the mean aggregation
+             # sparse_dense_matmul requires matching dtypes. adj is typically float32.
+             # If feat is float16 (mixed precision), we must cast to float32 temporarily.
+             if adj.values.dtype != feat.dtype:
+                 agg = tf.sparse.sparse_dense_matmul(adj, tf.cast(feat, adj.values.dtype))
+                 agg = tf.cast(agg, feat.dtype)
+             else:
+                 agg = tf.sparse.sparse_dense_matmul(adj, feat)  # (N, C)
+        else:
+             neighbors = tf.gather(feat, knn_idx)  # (N, K, C)
+             neighbors.set_shape([None, self.k, self.hidden_dim])
+             agg = tf.reduce_mean(neighbors, axis=1)  # (N, C)
+        
         agg.set_shape([None, self.hidden_dim])
 
-        nbr_coords = tf.gather(coords, knn_idx)  # (N, K, 3)
-        nbr_coords.set_shape([None, self.k, 3])
-        rel = nbr_coords - tf.expand_dims(coords, axis=1)
-        rel_mean = tf.reduce_mean(rel, axis=1)
-        rel_std = tf.math.reduce_std(rel, axis=1)
+        if adj is not None:
+            # Compute rel_mean and rel_std using sparse ops to avoid gather(coords)
+            # which produces sparse gradients (IndexedSlices) and triggers warnings.
+            # rel_mean = mean(x_j) - x_i
+            # rel_std = std(x_j - x_i) = std(x_j)
+            
+            c_dtype = coords.dtype
+            # Ensure float32 for matmul if mixed precision
+            if adj.values.dtype != c_dtype:
+                 coords_32 = tf.cast(coords, adj.values.dtype)
+                 mean_x = tf.sparse.sparse_dense_matmul(adj, coords_32)
+                 mean_x = tf.cast(mean_x, c_dtype)
+                 
+                 # E[x^2]
+                 mean_sq_x = tf.sparse.sparse_dense_matmul(adj, tf.square(coords_32))
+                 mean_sq_x = tf.cast(mean_sq_x, c_dtype)
+            else:
+                 mean_x = tf.sparse.sparse_dense_matmul(adj, coords)
+                 # E[x^2]
+                 mean_sq_x = tf.sparse.sparse_dense_matmul(adj, tf.square(coords))
+
+            rel_mean = mean_x - coords
+            # Var = E[x^2] - E[x]^2. Use relu for numerical stability.
+            var_x = tf.nn.relu(mean_sq_x - tf.square(mean_x))
+            rel_std = tf.sqrt(var_x)
+        else:
+            nbr_coords = tf.gather(coords, knn_idx)  # (N, K, 3)
+            nbr_coords.set_shape([None, self.k, 3])
+            rel = nbr_coords - tf.expand_dims(coords, axis=1)
+            rel_mean = tf.reduce_mean(rel, axis=1)
+            rel_std = tf.math.reduce_std(rel, axis=1)
         rel_feat = tf.concat([rel_mean, rel_std], axis=-1)  # (N, 6)
         rel_feat.set_shape([None, 6])
 
@@ -388,6 +428,37 @@ def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
             return ta_final.concat()
 
     return tf.cond(tf.equal(n, 0), _empty, _build)
+
+
+def _knn_to_adj(knn_idx: tf.Tensor, n_nodes: int | tf.Tensor) -> tf.sparse.SparseTensor:
+    """
+    Convert (N, K) knn indices to normalized (N, N) sparse adjacency matrix.
+    Values are 1.0/K (row-normalized).
+    """
+    knn_idx = tf.cast(knn_idx, tf.int64)
+    N = tf.shape(knn_idx)[0]
+    K = tf.shape(knn_idx)[1]
+    
+    # Construct indices: (row, col)
+    # rows: [0,0,..,0, 1,1,..,1, ...]
+    row_idx = tf.repeat(tf.range(N, dtype=tf.int64), repeats=K)
+    col_idx = tf.reshape(knn_idx, [-1])
+    
+    indices = tf.stack([row_idx, col_idx], axis=1) # (N*K, 2)
+    
+    # Values: 1/K
+    val = tf.cast(1.0 / tf.cast(K, tf.float32), tf.float32)
+    values = tf.fill([N * K], val)
+    
+    # Sort indices (required for sparse operations)
+    # Since we constructed row_idx sequentially, it should be sorted by row, 
+    # but strictly allow sparse_reorder to ensure correctness if col order matters or implementation changes.
+    sp = tf.sparse.SparseTensor(
+        indices=indices,
+        values=values,
+        dense_shape=[tf.cast(n_nodes, tf.int64), tf.cast(n_nodes, tf.int64)]
+    )
+    return tf.sparse.reorder(sp)
 
 
 # -----------------------------
@@ -517,6 +588,7 @@ class DisplacementNet(tf.keras.Model):
             )
         # 全局邻接缓存（可选）
         self._global_knn_idx: Optional[tf.Tensor] = None
+        self._global_adj: Optional[tf.sparse.SparseTensor] = None
         self._global_knn_n: Optional[int] = None
 
         # 输出缩放（可选可训练），便于微小位移量级的数值稳定
@@ -592,13 +664,17 @@ class DisplacementNet(tf.keras.Model):
             )
             if use_cached:
                 knn_idx = tf.cast(self._global_knn_idx, tf.int32)
+                adj = self._global_adj
             else:
                 knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+                # Dynamic construct adj
+                adj = _knn_to_adj(knn_idx, tf.shape(coords)[0])
+                
             hcur = self.graph_proj(h)
             film_gamma = self.film_gamma if self.use_film else None
             film_beta = self.film_beta if self.use_film else None
             for li, layer in enumerate(self.graph_layers):
-                hcur = layer(hcur, coords, knn_idx, training=training)
+                hcur = layer(hcur, coords, knn_idx, adj=adj, training=training)
                 if film_gamma is not None and film_beta is not None:
                     gamma = film_gamma[li](zb)
                     beta = film_beta[li](zb)
@@ -634,8 +710,12 @@ class DisplacementNet(tf.keras.Model):
         """预计算并缓存全局 kNN 邻接，用于整图前向以避免分块断图。"""
 
         coords = tf.convert_to_tensor(coords, dtype=tf.float32)
-        self._global_knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+        k = self.cfg.graph_k
+        self._global_knn_idx = _build_knn_graph(coords, k, self.cfg.graph_knn_chunk)
         self._global_knn_n = int(coords.shape[0]) if coords.shape.rank else None
+        
+        # Precompute sparse adj
+        self._global_adj = _knn_to_adj(self._global_knn_idx, self._global_knn_n)
 
 
 # -----------------------------

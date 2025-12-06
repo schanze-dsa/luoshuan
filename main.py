@@ -196,6 +196,9 @@ def _prepare_config_with_autoguess():
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
     output_cfg = cfg_yaml.get("output_config", {}) or {}
+    if "save_path" in output_cfg:
+        cfg.out_dir = str(output_cfg["save_path"])
+
     cfg.viz_use_shape_function_interp = bool(
         output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
     )

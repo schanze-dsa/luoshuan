@@ -113,10 +113,10 @@ C3D8_FACES = {
 }
 
 C3D4_FACES = {
-    "S1": (2, 3, 4),
-    "S2": (1, 4, 3),
-    "S3": (1, 2, 4),
-    "S4": (1, 3, 2),
+    "S1": (1, 2, 3),  # Face 1: nodes (n1, n2, n3)
+    "S2": (1, 2, 4),  # Face 2: nodes (n1, n2, n4)
+    "S3": (2, 3, 4),  # Face 3: nodes (n2, n3, n4)
+    "S4": (1, 3, 4),  # Face 4: nodes (n1, n3, n4)
 }
 
 # 6-node wedge
@@ -268,22 +268,39 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
             continue
 
         # not an integer -> ELSET name
+        # CRITICAL FIX: INP surface definition may have token='_MIRROR up' with face='S1',
+        # but actual ELSET name is '_MIRROR up_S1'. Try multiple variants.
+        # ALSO: asm.expand_elset() has a UnicodeEncodeError bug, so we bypass it and
+        # directly access asm.elsets dictionary.
+        # PRIORITY: Try suffixed names FIRST (most specific to least specific)
         eids: List[int] = []
-        try:
-            # preferred: parser's robust expander (handles trailing _S# and aliases)
-            eids = list(asm.expand_elset(str(token)))
-        except Exception:
-            # fallback: direct lookup + local raw-line expander
-            setdef = asm.elsets.get(str(token))
-            if setdef:
+        
+        # Build candidate ELSET names (ORDERED BY PRIORITY)
+        token_base = str(token).strip().strip('"').strip("'")
+        candidates = [
+            f'"{token_base}_{face_label}"',  # WITH quotes + suffix: "_MIRROR up_S1" (HIGHEST PRIORITY)
+            f'{token_base}_{face_label}',     # No quotes + suffix: _MIRROR up_S1
+            str(token),                        # Original with quotes: "_MIRROR up"
+            token_base,                        # Stripped: _MIRROR up (LOWEST PRIORITY)
+        ]
+        
+        # Try direct dict lookup first (bypasses expand_elset bug)
+        for cand in candidates:
+            if cand in asm.elsets:
+                setdef = asm.elsets[cand]
                 eids = _expand_elset_ids_fallback(setdef)
+                if eids:
+                    break
+        
+        # If still not found, try expand_elset (may fail)
         if not eids:
-            # try dequoted variant quickly
-            t = str(token).strip().strip('"').strip("'")
-            try:
-                eids = list(asm.expand_elset(t))
-            except Exception:
-                pass
+            for cand in candidates:
+                try:
+                    eids = list(asm.expand_elset(cand))
+                    if eids:
+                        break
+                except Exception:
+                    pass
 
         for eid2 in eids:
             info = elem_index.get(int(eid2))
