@@ -206,6 +206,7 @@ network_config:
   dfem_mode: false         # 关闭 DFEM 节点嵌入（回到 Fourier + GCN）；DFEM 能量积分仍由 ElasticityEnergy 提供
   n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
   node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
+  graph_precompute: true   # 预计算全局 kNN 邻接并缓存
 
   layers:
     - 64
@@ -345,9 +346,9 @@ preload_min: 0.0                   # 预紧力范围下限 (N)，显式写死
 preload_max: 2000.0                # 预紧力范围上限 (N)，显式写死
 preload_warn_on_missing_stress: false  # residual 模式缺少应力头时是否仅警告
 preload_error_on_missing_stress: true  # residual 模式缺少应力头时直接报错
-n_contact_points_per_pair: 2000     # 每对接触面的采样数（单阶段）
+n_contact_points_per_pair: 800      # 每对接触面的采样数（单阶段）
 preload_n_points_each: 400         # 单个螺栓端面的采样数
-resample_contact_every: 0  # 每隔多少步重采样接触点（0=只采样首步）
+resample_contact_every: 50  # 每隔多少步重采样接触点（0=只采样首步）
 
 alm_update_every: 0                # 交由阶段内 ALM 更新
 

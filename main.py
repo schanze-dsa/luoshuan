@@ -441,6 +441,9 @@ def _prepare_config_with_autoguess():
     if "node_emb_dim" in net_cfg_yaml:
         cfg.model_cfg.field.node_emb_dim = int(net_cfg_yaml["node_emb_dim"])
         print(f"[main] Node embedding dim: {cfg.model_cfg.field.node_emb_dim}")
+    if "graph_precompute" in net_cfg_yaml:
+        cfg.model_cfg.field.graph_precompute = bool(net_cfg_yaml["graph_precompute"])
+        print(f"[main] Graph precompute: {cfg.model_cfg.field.graph_precompute}")
 
     # ===== 接触力学参数（normal/friction）=====
     normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
