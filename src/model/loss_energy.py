@@ -292,8 +292,8 @@ class TotalEnergy:
             if "R_contact_comp" in stats_cn:
                 parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
 
-        # Tie constraints (skip if w_tie=0)
-        if self.ties and abs(self.w_tie) > 1e-15:
+        # Tie constraints (skip if config weight is effectively zero)
+        if self.ties and abs(float(getattr(self.cfg, "w_tie", 0.0))) > 1e-15:
             tie_terms = []
             for tie in self.ties:
                 et, tstat = tie.energy(u_fn, params)
@@ -312,8 +312,8 @@ class TotalEnergy:
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
 
-        # Preload work (skip if w_pre=0)
-        if self.preload is not None and abs(self.w_pre) > 1e-15:
+        # Preload work (skip if config weight is effectively zero)
+        if self.preload is not None and abs(float(getattr(self.cfg, "w_pre", 0.0))) > 1e-15:
             W_pre, pstats = self.preload.energy(u_fn, params, u_nodes=u_nodes)
             parts["W_pre"] = tf.cast(W_pre, dtype)
             # 同时暴露两种键：
@@ -499,7 +499,7 @@ class TotalEnergy:
             if "R_contact_comp" in stats_cn:
                 parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
 
-        if self.ties and abs(self.w_tie) > 1e-15:
+        if self.ties and abs(float(getattr(self.cfg, "w_tie", 0.0))) > 1e-15:
             tie_terms = []
             for tie in self.ties:
                 lt, tstat = tie.residual(u_fn, params)
@@ -518,7 +518,7 @@ class TotalEnergy:
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
 
-        if self.preload is not None and abs(self.w_pre) > 1e-15:
+        if self.preload is not None and abs(float(getattr(self.cfg, "w_pre", 0.0))) > 1e-15:
             L_pre, pstats = self.preload.residual(
                 u_fn, params, u_nodes=u_nodes, stress_fn=stress_fn
             )

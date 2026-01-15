@@ -464,6 +464,8 @@ def _prepare_config_with_autoguess():
 
     fric_cfg_yaml = cfg_yaml.get("friction_config", {}) or {}
     if isinstance(fric_cfg_yaml, dict) and fric_cfg_yaml:
+        if "enabled" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.enabled = bool(fric_cfg_yaml["enabled"])
         if "k_t" in fric_cfg_yaml:
             cfg.contact_cfg.friction.k_t = float(fric_cfg_yaml["k_t"])
         if "mu_t" in fric_cfg_yaml:

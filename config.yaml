@@ -264,7 +264,7 @@ loss_config:
 
     # 【恢复摩擦】Ect ~ 5e7 (k_t降低后), 乘 1e-8 后约 0.5
     # 摩擦是核心物理，必须保留！通过降低k_t来控制数值
-    w_ct: 1.0
+    w_ct: 0.0
 
     # 【禁用Tie约束】Etie完全冻结在1.001e+07，阻碍训练
     # 暂时禁用，等修复后再启用
@@ -295,7 +295,7 @@ loss_config:
       - w_eq
       - w_cn
       - w_bc
-      - w_ct
+      # - w_ct
       # 注意：预紧外功 W_pre 不参与自适应加权（避免等价“缩放载荷”）。
       # 预紧项的权重会与 w_int 保持固定比例（由代码绑定），从而保持 P 的物理意义不变。
 
@@ -305,12 +305,13 @@ loss_config:
 # 关键修复：降低摩擦惩罚系数k_t以匹配弹性能量scale
 # 当前问题：Ect=2.6e8远大于Eint=2.5e5，导致梯度NaN
 friction_config:
-  k_t: 10.0           # 切向惩罚刚度 - 从默认500降低到10 (50倍降低!)
-  mu_t: 1.0e3         # ALM增广系数 (保持默认)
-  mu_f: 0.15          # Coulomb摩擦系数 (~0.1-0.2 for steel/aluminum)
-  use_smooth_friction: true   # 先平滑、后严格（由 smooth_to_strict 控制）
-  use_delta_st_friction: true
-  smooth_to_strict: true
+  enabled: false
+  k_t: 0.0            # 关闭切向惩罚刚度
+  mu_t: 1.0e3         # 保留数值稳定系数（实际不会起作用）
+  mu_f: 0.0           # 关闭库仑摩擦
+  use_smooth_friction: false  # 关闭摩擦平滑路径
+  use_delta_st_friction: false
+  smooth_to_strict: false
   smooth_fraction: 0.3
   smooth_steps: 300
   blend_steps: 200

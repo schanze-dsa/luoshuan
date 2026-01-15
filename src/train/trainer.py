@@ -2377,30 +2377,24 @@ class Trainer:
             _, parts, stats = total.energy(
                 self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
             )
-
-            def _with_lock():
-                preload_stats = stats.get("preload") or stats.get("preload_stats")
-                stage_mask = params.get("stage_mask")
-                stage_last = params.get("stage_last")
-                if (
-                    isinstance(preload_stats, Mapping)
-                    and preload_stats.get("bolt_deltas") is not None
-                    and stage_mask is not None
-                    and stage_last is not None
-                ):
-                    bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
-                    lock_mask = tf.clip_by_value(
-                        tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
-                    )
-                    res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
-                    parts["E_lock"] = tf.reduce_sum(res * res)
-                else:
-                    parts["E_lock"] = tf.cast(0.0, tf.float32)
-
-            def _no_lock():
-                parts["E_lock"] = tf.cast(0.0, tf.float32)
-
-            tf.cond(use_lock, _with_lock, _no_lock)
+            preload_stats = stats.get("preload") or stats.get("preload_stats")
+            stage_mask = params.get("stage_mask")
+            stage_last = params.get("stage_last")
+            E_lock = tf.cast(0.0, tf.float32)
+            if (
+                isinstance(preload_stats, Mapping)
+                and preload_stats.get("bolt_deltas") is not None
+                and stage_mask is not None
+                and stage_last is not None
+            ):
+                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
+                lock_mask = tf.clip_by_value(
+                    tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
+                )
+                res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
+                E_lock = tf.reduce_sum(res * res)
+            E_lock = tf.cast(use_lock, tf.float32) * E_lock
+            parts["E_lock"] = E_lock
 
             loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
             reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0

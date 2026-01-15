@@ -89,6 +89,7 @@ except Exception:  # 允许单文件调试时的降级实现
 @dataclass
 class FrictionALMConfig:
     # 物理/数值参数
+    enabled: bool = True      # master switch for friction (False -> skip friction entirely)
     mu_f: float = 0.15          # Coulomb friction coefficient
     k_t: float = 5.0e2          # tangential penalty "stiffness" (for trial traction)
     mu_t: float = 1.0e3         # ALM coefficient for tangential residual pseudo-energy
@@ -416,7 +417,7 @@ class FrictionContactALM:
         其中 w_eff = w * extra_weights（若 extra_weights 为 None，则 w_eff = w）。
         """
         # 切向滑移
-        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes)           # (N,2)
+        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes, update_cache=True)  # (N,2)
 
         # 有效权重：保留 self.w 作为几何/面积基权重，额外权重只在本次调用中生效
         w_eff = self.w

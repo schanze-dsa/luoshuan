@@ -98,6 +98,21 @@ class ContactOperator:
         self._step: int = 0
         self._meta: Dict[str, np.ndarray] = {}
 
+    def _friction_active(self) -> bool:
+        cfg = getattr(self.cfg, "friction", None)
+        if cfg is None:
+            return False
+        if not bool(getattr(cfg, "enabled", True)):
+            return False
+        try:
+            mu_f = float(getattr(cfg, "mu_f", 0.0) or 0.0)
+            k_t = float(getattr(cfg, "k_t", 0.0) or 0.0)
+        except Exception:
+            return True
+        if mu_f <= 0.0 or k_t <= 0.0:
+            return False
+        return True
+
     # ---------- build per batch ----------
 
     def build_from_cat(
@@ -140,10 +155,13 @@ class ContactOperator:
         for k in interp_keys:
             if k in cat:
                 fric_cat[k] = cat[k]
-        self.friction.build_from_cat(
-            fric_cat,
-            extra_weights=extra_weights,
-        )
+        if self._friction_active():
+            self.friction.build_from_cat(
+                fric_cat,
+                extra_weights=extra_weights,
+            )
+        else:
+            self.friction.reset_for_new_batch()
 
         self._N = int(cat["xs"].shape[0])
         self._built = True
@@ -202,7 +220,11 @@ class ContactOperator:
             raise RuntimeError("[ContactOperator] call build_from_cat() before energy().")
 
         En, stats_cn = self.normal.energy(u_fn, params, u_nodes=u_nodes)
-        Et, stats_ct = self.friction.energy(u_fn, params, u_nodes=u_nodes)
+        if self._friction_active():
+            Et, stats_ct = self.friction.energy(u_fn, params, u_nodes=u_nodes)
+        else:
+            Et = tf.cast(0.0, self.dtype)
+            stats_ct = {}
 
         E = En + Et
         parts = {"E_n": En, "E_t": Et}
@@ -225,7 +247,11 @@ class ContactOperator:
             raise RuntimeError("[ContactOperator] call build_from_cat() before residual().")
 
         L_n, stats_cn = self.normal.residual(u_fn, params, u_nodes=u_nodes)
-        L_t, stats_ct = self.friction.residual(u_fn, params, u_nodes=u_nodes)
+        if self._friction_active():
+            L_t, stats_ct = self.friction.residual(u_fn, params, u_nodes=u_nodes)
+        else:
+            L_t = tf.cast(0.0, self.dtype)
+            stats_ct = {}
 
         L = L_n + L_t
         parts = {"E_n": L_n, "E_t": L_t}
@@ -250,7 +276,8 @@ class ContactOperator:
 
         if do_update:
             self.normal.update_multipliers(u_fn, params, u_nodes=u_nodes)
-            self.friction.update_multipliers(u_fn, params, u_nodes=u_nodes)
+            if self._friction_active():
+                self.friction.update_multipliers(u_fn, params, u_nodes=u_nodes)
 
         self._step += 1
 
@@ -272,7 +299,7 @@ class ContactOperator:
                 metrics["gap"] = np.asarray(self.normal._last_gap.numpy()).reshape(-1)
             except Exception:
                 pass
-        if getattr(self.friction, "_last_r_norm", None) is not None:
+        if self._friction_active() and getattr(self.friction, "_last_r_norm", None) is not None:
             try:
                 metrics["fric_res"] = np.asarray(self.friction._last_r_norm.numpy()).reshape(-1)
             except Exception:
@@ -288,18 +315,18 @@ class ContactOperator:
 
     def snapshot_stage_state(self) -> Dict[str, np.ndarray]:
         """Snapshot frictional state so staged preload can carry order-dependent stick/slip."""
-        if hasattr(self.friction, "snapshot_state"):
+        if self._friction_active() and hasattr(self.friction, "snapshot_state"):
             return self.friction.snapshot_state()
         return {}
 
     def restore_stage_state(self, state: Dict[str, np.ndarray]):
         """Restore frictional state from :meth:`snapshot_stage_state`."""
-        if hasattr(self.friction, "restore_state"):
+        if self._friction_active() and hasattr(self.friction, "restore_state"):
             self.friction.restore_state(state)
 
     def last_friction_slip(self):
         """Expose cached tangential slip for staged path-penalty construction."""
-        if hasattr(self.friction, "last_slip"):
+        if self._friction_active() and hasattr(self.friction, "last_slip"):
             return self.friction.last_slip()
         return None
 
