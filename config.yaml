@@ -207,6 +207,7 @@ network_config:
   n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
   node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
   graph_precompute: true   # 预计算全局 kNN 邻接并缓存
+  graph_k: 8               # kNN 邻居数（提速用；固体力学通常够用）
 
   layers:
     - 64
