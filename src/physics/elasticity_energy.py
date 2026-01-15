@@ -40,6 +40,7 @@ class ElasticityConfig:
     n_points_per_step: Optional[int] = None
     # 应力监督：若模型提供应力输出头，可用线弹性理论应力指导，0 表示关闭
     stress_loss_weight: float = 1.0
+    plasticity_model: str = "elastic"
 
 
 class ElasticityEnergy:
@@ -117,6 +118,12 @@ class ElasticityEnergy:
         w = np.asarray(dfem_data["w"], dtype=np.float32)
         lam = np.asarray(dfem_data["lam"], dtype=np.float32)
         mu = np.asarray(dfem_data["mu"], dtype=np.float32)
+        sigma_y = np.asarray(
+            dfem_data.get("sigma_y", np.full_like(lam, np.inf)), dtype=np.float32
+        )
+        hardening = np.asarray(
+            dfem_data.get("hardening", np.zeros_like(lam)), dtype=np.float32
+        )
         dof_idx = np.asarray(dfem_data["dof_idx"], dtype=np.int32)
 
         # 基本形状检查
@@ -133,7 +140,19 @@ class ElasticityEnergy:
                 "[ElasticityEnergy] w / lam / mu / dof_idx 维度错误："
                 f"{w.shape}, {lam.shape}, {mu.shape}, {dof_idx.shape}"
             )
-        if not (B.shape[0] == w.shape[0] == lam.shape[0] == mu.shape[0] == dof_idx.shape[0]):
+        if sigma_y.ndim != 1 or hardening.ndim != 1:
+            raise ValueError(
+                f"[ElasticityEnergy] sigma_y/hardening shape error: {sigma_y.shape}, {hardening.shape}"
+            )
+        if not (
+            B.shape[0]
+            == w.shape[0]
+            == lam.shape[0]
+            == mu.shape[0]
+            == sigma_y.shape[0]
+            == hardening.shape[0]
+            == dof_idx.shape[0]
+        ):
             raise ValueError("[ElasticityEnergy] DFEM 子单元数量不一致")
 
         if not np.all(np.isfinite(X_nodes)):
@@ -144,6 +163,10 @@ class ElasticityEnergy:
             raise ValueError("[ElasticityEnergy] 权重 w 含 NaN/Inf")
         if not np.all(np.isfinite(lam)) or not np.all(np.isfinite(mu)):
             raise ValueError("[ElasticityEnergy] 材料参数 λ/μ 含 NaN/Inf")
+        if np.any(np.isnan(sigma_y)):
+            raise ValueError("[ElasticityEnergy] sigma_y contains NaN")
+        if not np.all(np.isfinite(hardening)):
+            raise ValueError("[ElasticityEnergy] hardening contains NaN/Inf")
 
         # 缓存为 Tensor
         self.X_nodes_tf = tf.convert_to_tensor(X_nodes, dtype=tf.float32)   # (N,3)
@@ -151,6 +174,8 @@ class ElasticityEnergy:
         self.w_tf = tf.convert_to_tensor(w, dtype=tf.float32)               # (K,)
         self.lam_tf = tf.convert_to_tensor(lam, dtype=tf.float32)           # (K,)
         self.mu_tf = tf.convert_to_tensor(mu, dtype=tf.float32)             # (K,)
+        self.sigma_y_tf = tf.convert_to_tensor(sigma_y, dtype=tf.float32)   # (K,)
+        self.hardening_tf = tf.convert_to_tensor(hardening, dtype=tf.float32)  # (K,)
         self.dof_idx_tf = tf.convert_to_tensor(dof_idx, dtype=tf.int32)     # (K,12)
 
         # 记录规模信息与总权重
@@ -238,6 +263,8 @@ class ElasticityEnergy:
         w_sel = tf.gather(self.w_tf, idx)         # (M,)
         lam_sel = tf.gather(self.lam_tf, idx)     # (M,)
         mu_sel = tf.gather(self.mu_tf, idx)       # (M,)
+        sigma_y_sel = tf.gather(self.sigma_y_tf, idx)  # (M,)
+        hardening_sel = tf.gather(self.hardening_tf, idx)  # (M,)
         dof_idx_sel = tf.gather(self.dof_idx_tf, idx)  # (M,12)
 
         # 3) 取出每个子单元的局部 DOF，计算应变 ε 与能量密度 ψ
@@ -249,15 +276,74 @@ class ElasticityEnergy:
         eps_vec = tf.einsum("mij,mj->mi", B_sel, u_local)
 
         if self.cfg.check_nan:
-            tf.debugging.check_numerics(eps_vec, "[ElasticityEnergy] strain ε has NaN/Inf")
+            tf.debugging.check_numerics(eps_vec, "[ElasticityEnergy] strain eps has NaN/Inf")
 
-        # 能量密度 ψ = 1/2 λ (tr ε)^2 + μ (ε:ε)
-        tr_eps = eps_vec[:, 0] + eps_vec[:, 1] + eps_vec[:, 2]         # (M,)
-        eps_sq = tf.reduce_sum(eps_vec * eps_vec, axis=1)              # (M,)
-        psi = 0.5 * lam_sel * (tr_eps ** 2.0) + mu_sel * eps_sq        # (M,)
+        # convert engineering shear to tensor shear
+        eps_tensor = tf.stack(
+            [
+                eps_vec[:, 0],
+                eps_vec[:, 1],
+                eps_vec[:, 2],
+                0.5 * eps_vec[:, 3],
+                0.5 * eps_vec[:, 4],
+                0.5 * eps_vec[:, 5],
+            ],
+            axis=1,
+        )
+
+        def _voigt_tensor_dot(a: tf.Tensor, b: tf.Tensor) -> tf.Tensor:
+            return (
+                a[:, 0] * b[:, 0]
+                + a[:, 1] * b[:, 1]
+                + a[:, 2] * b[:, 2]
+                + 2.0 * (a[:, 3] * b[:, 3] + a[:, 4] * b[:, 4] + a[:, 5] * b[:, 5])
+            )
+
+        tr_eps = eps_tensor[:, 0] + eps_tensor[:, 1] + eps_tensor[:, 2]  # (M,)
+        eps_sq = _voigt_tensor_dot(eps_tensor, eps_tensor)  # (M,)
+
+        plasticity = str(getattr(self.cfg, "plasticity_model", "elastic") or "elastic").lower()
+        use_plastic = plasticity in {"j2", "von_mises", "vm", "plastic", "elastoplastic", "elasto_plastic"}
+
+        eye_vec = tf.constant([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=eps_tensor.dtype)
+        sigma_phys = None
+        plastic_ratio = None
+
+        if use_plastic:
+            kappa = lam_sel + (2.0 / 3.0) * mu_sel
+            eps_dev = eps_tensor - (tr_eps / 3.0)[:, None] * eye_vec
+            s_trial = 2.0 * mu_sel[:, None] * eps_dev
+            s_dot = _voigt_tensor_dot(s_trial, s_trial)
+            seq_trial = tf.sqrt(1.5 * s_dot + 1e-20)
+
+            sigma_y_eff = tf.maximum(sigma_y_sel, tf.cast(0.0, seq_trial.dtype))
+            hardening_eff = tf.maximum(hardening_sel, tf.cast(0.0, seq_trial.dtype))
+            f_trial = seq_trial - sigma_y_eff
+
+            denom = 3.0 * mu_sel + hardening_eff
+            denom = tf.where(denom > 0.0, denom, tf.ones_like(denom))
+            delta_gamma = tf.maximum(f_trial, 0.0) / (denom + 1e-20)
+            coeff = 1.0 - (3.0 * mu_sel * delta_gamma) / (seq_trial + 1e-20)
+            coeff = tf.where(f_trial > 0.0, coeff, tf.ones_like(coeff))
+            s_new = s_trial * coeff[:, None]
+
+            p = kappa * tr_eps
+            sigma_phys = p[:, None] * eye_vec + s_new
+
+            mu_safe = tf.where(mu_sel > 0.0, mu_sel, tf.ones_like(mu_sel))
+            eps_e_dev = s_new / (2.0 * mu_safe[:, None])
+            eps_e = eps_e_dev + (tr_eps / 3.0)[:, None] * eye_vec
+            eps_e_sq = _voigt_tensor_dot(eps_e, eps_e)
+            psi = 0.5 * lam_sel * (tr_eps ** 2.0) + mu_sel * eps_e_sq
+
+            plastic_ratio = tf.reduce_mean(tf.cast(f_trial > 0.0, eps_tensor.dtype))
+        else:
+            sigma_phys = lam_sel[:, None] * tr_eps[:, None] * eye_vec + 2.0 * mu_sel[:, None] * eps_tensor
+            psi = 0.5 * lam_sel * (tr_eps ** 2.0) + mu_sel * eps_sq
 
         if self.cfg.check_nan:
-            tf.debugging.check_numerics(psi, "[ElasticityEnergy] energy density ψ has NaN/Inf")
+            tf.debugging.check_numerics(psi, "[ElasticityEnergy] energy density psi has NaN/Inf")
+            tf.debugging.check_numerics(sigma_phys, "[ElasticityEnergy] stress sigma has NaN/Inf")
 
         # 4) 对选中的子单元积分，并按总权重做无偏缩放
         w_used_sum = tf.reduce_sum(w_sel)
@@ -287,13 +373,21 @@ class ElasticityEnergy:
             "use_pfor": bool(self.cfg.use_pfor),
             "coord_scale": float(self._scale),
         }
+        if plastic_ratio is not None:
+            stats["plastic_ratio"] = plastic_ratio
         if not return_cache:
             return E_int, stats
 
         cache = {
             "eps_vec": eps_vec,
+            "eps_tensor": eps_tensor,
+            "sigma_phys": sigma_phys,
             "lam": lam_sel,
             "mu": mu_sel,
+            "sigma_y": sigma_y_sel,
+            "hardening": hardening_sel,
+            "B_sel": B_sel,
+            "w_sel": w_sel,
             "dof_idx": dof_idx_sel,
             "sample_idx": idx,
         }

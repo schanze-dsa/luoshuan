@@ -112,6 +112,7 @@ class LossWeightState:
 
     update_every: int = 1
     focus_terms: Tuple[str, ...] = tuple()
+    sign_overrides: Dict[str, float] | None = None
 
     step: int = 0
 
@@ -136,6 +137,7 @@ class LossWeightState:
         gamma: float = 2.0,
         focus_terms: Tuple[str, ...] | None = None,
         update_every: int = 1,
+        sign_overrides: Dict[str, float] | None = None,
     ) -> "LossWeightState":
         """
         从配置初始化一个 LossWeightState。
@@ -151,6 +153,38 @@ class LossWeightState:
         """
         base = dict(base_weights)
         current = dict(base_weights)
+        # Respect absolute weight bounds from the very first step to reduce
+        # early instability before the first adaptive update happens.
+        if (min_weight is not None) or (max_weight is not None):
+            min_w = float(min_weight) if min_weight is not None else None
+            max_w = float(max_weight) if max_weight is not None else None
+            warned_terms: list[str] = []
+            for key, value in list(current.items()):
+                try:
+                    weight = float(value)
+                except Exception:
+                    continue
+                # Keep disabled terms disabled; also treat negative weights as disabled.
+                if weight <= 0.0:
+                    continue
+                if min_w is not None:
+                    weight = max(min_w, weight)
+                if max_w is not None:
+                    # Allow base weights to exceed the global max bound; treat the
+                    # base value as a per-term ceiling to avoid silently weakening
+                    # important constraint terms like BCs.
+                    base_w = float(base.get(key, weight))
+                    eff_max = max(max_w, base_w)
+                    if base_w > max_w:
+                        warned_terms.append(f"{key}={base_w:g}")
+                    weight = min(eff_max, weight)
+                current[key] = weight
+            if warned_terms:
+                joined = ", ".join(warned_terms)
+                print(
+                    f"[loss_weights] WARNING: base weights exceed max_weight={max_w:g}; "
+                    f"keeping base as per-term max for: {joined}"
+                )
         return cls(
             base=base,
             current=current,
@@ -163,6 +197,7 @@ class LossWeightState:
             gamma=gamma,
             focus_terms=tuple(focus_terms or tuple()),
             update_every=max(int(update_every), 1),
+            sign_overrides=sign_overrides,
         )
 
     def as_dict(self) -> Dict[str, float]:
@@ -298,14 +333,16 @@ def update_loss_weights(
             state.last_factors = {}
             min_w = state.min_weight
             max_w = state.max_weight
-            for term, w_old, factor in zip(term_order, weights_now, factors):
-                new_w = float(w_old) * float(factor)
+            for term, factor in zip(term_order, factors):
+                base_w = float(state.base.get(term, 0.0))
+                new_w = base_w * float(factor)
                 if new_w < 0.0:
                     new_w = 0.0
                 if min_w is not None:
                     new_w = max(float(min_w), new_w)
                 if max_w is not None:
-                    new_w = min(float(max_w), new_w)
+                    eff_max = max(float(max_w), base_w)
+                    new_w = min(eff_max, new_w)
                 new_current[term] = new_w
                 state.last_factors[term] = float(factor)
         else:
@@ -328,13 +365,15 @@ def update_loss_weights(
             for term, factor in zip(term_order, factors):
                 if term not in new_current:
                     continue
-                new_w = float(new_current[term]) * float(factor)
+                base_w = float(new_current[term])
+                new_w = base_w * float(factor)
                 if new_w < 0.0:
                     new_w = 0.0
                 if min_w is not None:
                     new_w = max(float(min_w), new_w)
                 if max_w is not None:
-                    new_w = min(float(max_w), new_w)
+                    eff_max = max(float(max_w), base_w)
+                    new_w = min(eff_max, new_w)
                 new_current[term] = new_w
                 state.last_factors[term] = float(factor)
 
@@ -450,9 +489,11 @@ def combine_loss(
     # a negative sign.  Keep a small map of such terms so combine_loss stays
     # consistent with TotalEnergy.Pi's baseline formulation even when adaptive
     # weighting is enabled.
-    sign_overrides = {
-        "W_pre": -1.0,
-    }
+    sign_overrides = state.sign_overrides
+    if sign_overrides is None:
+        sign_overrides = {
+            "W_pre": -1.0,
+        }
 
     for name, value in parts.items():
         # 只组合标量项

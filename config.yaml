@@ -65,6 +65,7 @@ material_properties:
     sigma_y_tension: 2.5e2        # MPa
     sigma_y_compression: 2.5e2    # MPa
     sigma_u_tension: 4.6e2        # MPa
+    hardening_modulus: 1.0e3      # MPa (linear isotropic hardening, conservative)
 
   zhijia:
     # ---- 基本弹性参数 ----
@@ -115,15 +116,25 @@ bolts:
 
 # 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
 preload_staging:
+  mode: force_then_lock
   enabled: true              # 启用分阶段加载 -> PINN 输入包含顺序信息
-  randomize_order: true      # 训练时随机打乱三颗螺栓的加载顺序
-  repeat: 3                  # 每组顺序持续的步数（>1 时可重复使用同一组合）
+  randomize_order: false     # 固定顺序
+  repeat: 1                  # 固定 case
   shuffle: false             # 若提供 sequence 列表，是否在 epoch 间随机打乱条目
   jitter: 0.0                # 顺序列表在训练时叠加的 ±jitter 噪声（N）
   relaxation: 0.25           # 顺序松弛系数；>0 时早拧的螺栓载荷放大、晚拧的减小
   # sequence:               # 如需固定顺序，可取消注释并填写：
   #   - values: [800, 600, 500]
   #     order:  [1, 3, 2]    # 顺序字段支持 1-based 或 0-based
+
+preload_use_stages: true
+preload_randomize_order: false
+preload_sequence:
+  - values: [1500, 1500, 1500]
+    order: [1, 2, 3]
+preload_sequence_repeat: 1
+preload_sequence_shuffle: false
+preload_sequence_jitter: 0.0
 
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
@@ -190,12 +201,12 @@ network_config:
   model_type: pinn         # 保留兼容性
   input_dim: 3             # P输入维度 (P1,P2,P3)
   output_dim: 1            # 保留字段（实际由FieldConfig.out_dim控制）
-  
+
   # DFEM mode: use node embeddings instead of spatial coordinates
   dfem_mode: false         # 关闭 DFEM 节点嵌入（回到 Fourier + GCN）；DFEM 能量积分仍由 ElasticityEnergy 提供
   n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
   node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
-  
+
   layers:
     - 64
     - 64
@@ -207,12 +218,14 @@ network_config:
 # 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
 mirror_surface_name: 'MIRROR up'
 
+mixed_precision: "mixed_float16"          # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
+
 optimizer_config:
   type: Adam
   learning_rate: 0.00001     # 从1e-4降到1e-5，防止DFEM初期NaN
   grad_clip_norm: 1.0        # 从10降到1，加强裁剪防止梯度爆炸
   batch_size: 32
-  epochs: 1000              # Adam 阶段的迭代步数
+  epochs: 1500             # Adam 阶段的迭代步数
   lbfgs:
     enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
     max_iter: 200            # L-BFGS 最大迭代次数
@@ -229,50 +242,58 @@ elasticity_config:
   chunk_size: 0             # 节点前向微批大小；≤0 表示整图前向，不再分块
   use_pfor: false           # 保留字段，可忽略
   check_nan: true           # 是否进行数值 NaN 检查
-  n_points_per_step: 4096   # 每步用于 DFEM 积分的子单元/积分点上限；None 表示全量
+  n_points_per_step: 2048   # 每步用于 DFEM 积分的子单元/积分点上限；None/0 表示全量
+  plasticity_model: j2      # elastic | j2 (von Mises)
 
 # ------------------------------------------------------------
 # 7. 损失函数与自适应加权（TotalConfig + weighted PINN）
 # ------------------------------------------------------------
 loss_config:
+  mode: residual
   base_weights:
     # 策略：将所有项的加权后能量 (weighted energy) 统一控制在 1.0 ~ 10.0 左右
-    
+
     # DFEM节点嵌入随机初始化导致Eint爆炸，需要降低100倍
     # Eint初始~1e6, 乘1e-7后约0.1，待稳定后可逐步提高
-    w_int: 1.0e-7
-    
+    w_int: 0.0
+
     # Ecn ~ 3e4, 乘 1e-4 后约 3.0 (接触很重要，稍微大点没关系)
-    w_cn: 1.0e-4
-    
+    w_cn: 1.0
+
     # 【恢复摩擦】Ect ~ 5e7 (k_t降低后), 乘 1e-8 后约 0.5
     # 摩擦是核心物理，必须保留！通过降低k_t来控制数值
-    w_ct: 1.0e-8
-    
+    w_ct: 1.0
+
     # 【禁用Tie约束】Etie完全冻结在1.001e+07，阻碍训练
     # 暂时禁用，等修复后再启用
     w_tie: 0.0        # 从1e-10改为0，完全禁用
-    w_bc: 1.0e-2      # 边界条件通常残差较小，给大一点
-    
+    w_bc: 1.0      # 边界条件通常残差较小，给大一点
+
     # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
-    w_pre: 1.0e-7     # 启用预紧外功项（P 为总力 N，Δ 为轴向位移差；该系数仅用于数值缩放）
-    
+    w_pre: 1.0     # 增强预紧外功项，使解对P更敏感（仅数值缩放；不改变P的物理含义）
+
     # 应力监督：用线弹性理论应力指导网络
     # Esig ~ 1e7, 需要非常小的权重
-    w_sigma: 1.0e-4   # 从1.0降到1e-4，防止主导损失
+    w_sigma: 1.0   # 从1.0降到1e-4，防止主导损失
+    # 平衡残差：弱式 equilibrium (B^T * sigma_pred ≈ 0)，与应力头强耦合
+    w_eq: 1.0      # 先用与 w_sigma 同量级；如不稳可降到 1e-5
 
+    w_reg: 1.0e-4
+
+    w_lock: 5.0e-2     # staged preload: lock penalty (force_then_lock) - 强化“锁长+卸载”路径依赖
   adaptive:
     # 暂时开启，但必须限制范围！防止它自动把 w_ct 调回 9.0 这种危险值
     enabled: true
-    update_every: 10
+    update_every: 50
     ema_decay: 0.99
     temperature: 1.0
-    min_weight: 1.0e-10   # 允许权重变得非常小
-    max_weight: 1.0e-3    # 【关键】强制上限！绝对不能让权重超过 0.001
+    min_weight: 1.0e-6   # ?????????
+    max_weight: 10.0     # residual-only ????
     focus_terms:
-      - w_int
+      - w_eq
       - w_cn
-      - w_ct    # 保留摩擦项的自适应调整
+      - w_bc
+      - w_ct
       # 注意：预紧外功 W_pre 不参与自适应加权（避免等价“缩放载荷”）。
       # 预紧项的权重会与 w_int 保持固定比例（由代码绑定），从而保持 P 的物理意义不变。
 
@@ -285,11 +306,18 @@ friction_config:
   k_t: 10.0           # 切向惩罚刚度 - 从默认500降低到10 (50倍降低!)
   mu_t: 1.0e3         # ALM增广系数 (保持默认)
   mu_f: 0.15          # Coulomb摩擦系数 (~0.1-0.2 for steel/aluminum)
-  use_smooth_friction: false  # 平滑摩擦 - 保持false以避免额外复杂度
-
+  use_smooth_friction: true   # 先平滑、后严格（由 smooth_to_strict 控制）
+  use_delta_st_friction: true
+  smooth_to_strict: true
+  smooth_fraction: 0.3
+  smooth_steps: 300
+  blend_steps: 200
 normal_config:
+  mode: "alm"
   beta: 50.0          # 法向接触惩罚 (保持默认)
   mu_n: 1.0e3         # 法向ALM系数
+  residual_mode: fb
+  fb_eps: 1.0e-8
 
 # ------------------------------------------------------------
 # 8. 输出与可视化
@@ -312,10 +340,21 @@ inp_path: D:/shuangfan/shuangfan.inp
 # ------------------------------------------------------------
 # 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
 # ------------------------------------------------------------
-n_contact_points_per_pair: 2400     # 每对接触面的采样数（单阶段）
-preload_n_points_each: 800         # 单个螺栓端面的采样数
-resample_contact_every: 5          # 每隔多少步重采样接触点（0=只采样首步）
-alm_update_every: 75               # 接触 ALM 罚乘子更新周期
+debug_big_model: false             # 是否放大网络容量（默认关闭，避免无条件改模型尺寸）
+preload_min: 0.0                   # 预紧力范围下限 (N)，显式写死
+preload_max: 2000.0                # 预紧力范围上限 (N)，显式写死
+n_contact_points_per_pair: 2000     # 每对接触面的采样数（单阶段）
+preload_n_points_each: 400         # 单个螺栓端面的采样数
+resample_contact_every: 0  # 每隔多少步重采样接触点（0=只采样首步）
+
+alm_update_every: 0                # 交由阶段内 ALM 更新
+
+incremental_mode: true
+stage_inner_steps: 5
+stage_alm_every: 1
+stage_resample_contact: true
+reset_contact_state_per_case: true
+stage_schedule_steps: [400, 400, 400, 300]
 
 
 n_tie_points: 2000

@@ -160,6 +160,16 @@ class ContactOperator:
         self._step = 0
         self._meta = {}
 
+    def reset_multipliers(self, reset_reference: bool = True):
+        """Reset ALM multipliers without changing the current contact samples."""
+        if not self._built:
+            return
+        if hasattr(self.normal, "reset_multipliers"):
+            self.normal.reset_multipliers()
+        if hasattr(self.friction, "reset_multipliers"):
+            self.friction.reset_multipliers(reset_reference=reset_reference)
+        self._step = 0
+
     # ---------- energy & update ----------
 
     def energy(
@@ -198,6 +208,28 @@ class ContactOperator:
         parts = {"E_n": En, "E_t": Et}
 
         return E, parts, stats_cn, stats_ct
+
+    def residual(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor], Dict[str, tf.Tensor], Dict[str, tf.Tensor]]:
+        """
+        Residual-only contact term (normal + friction), without energy semantics.
+        Returns:
+            L_contact_total, part_dict, stats_cn, stats_ct
+        """
+        if not self._built:
+            raise RuntimeError("[ContactOperator] call build_from_cat() before residual().")
+
+        L_n, stats_cn = self.normal.residual(u_fn, params, u_nodes=u_nodes)
+        L_t, stats_ct = self.friction.residual(u_fn, params, u_nodes=u_nodes)
+
+        L = L_n + L_t
+        parts = {"E_n": L_n, "E_t": L_t}
+        return L, parts, stats_cn, stats_ct
 
     def update_multipliers(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None):
         """

@@ -99,6 +99,8 @@ def build_dfem_subcells(asm, part2mat, materials):
     vol_list = []
     lam_list = []
     mu_list = []
+    sigma_y_list = []
+    hardening_list = []
     dof_idx_list = []
 
     # 遍历所有 Part（CD3D8/C3D4 都被拆成四面体）
@@ -111,12 +113,63 @@ def build_dfem_subcells(asm, part2mat, materials):
             raise KeyError(f"材料 '{mat_name}' 未在 materials 字典中注册。")
 
         mat_props = materials[mat_name]
+        sigma_y = float("inf")
+        hardening = 0.0
         if isinstance(mat_props, (tuple, list)) and len(mat_props) >= 2:
             E, nu = float(mat_props[0]), float(mat_props[1])
+            if len(mat_props) >= 3:
+                try:
+                    sigma_y = float(mat_props[2])
+                except Exception:
+                    sigma_y = float("inf")
+            if len(mat_props) >= 4:
+                try:
+                    hardening = float(mat_props[3])
+                except Exception:
+                    hardening = 0.0
         elif isinstance(mat_props, dict):
             try:
                 E = float(mat_props["E"])
                 nu = float(mat_props["nu"])
+
+                # yield (MPa): prefer explicit keys; else min(tension, compression); missing -> +inf
+                sigma_y_val = None
+                for k in ("sigma_y", "yield_strength"):
+                    if k in mat_props:
+                        try:
+                            sigma_y_val = float(mat_props[k])
+                            break
+                        except Exception:
+                            sigma_y_val = None
+                if sigma_y_val is None:
+                    cands = []
+                    for k in ("sigma_y_tension", "sigma_y_compression"):
+                        if k in mat_props:
+                            try:
+                                cands.append(float(mat_props[k]))
+                            except Exception:
+                                pass
+                    cands = [v for v in cands if np.isfinite(v) and v > 0]
+                    sigma_y_val = float(min(cands)) if cands else None
+                if sigma_y_val is not None and np.isfinite(sigma_y_val) and sigma_y_val > 0:
+                    sigma_y = float(sigma_y_val)
+
+                # linear isotropic hardening modulus H (MPa); missing -> 0
+                for k in (
+                    "hardening_modulus",
+                    "plastic_hardening_modulus",
+                    "iso_hardening_modulus",
+                    "H_iso",
+                    "H",
+                ):
+                    if k in mat_props:
+                        try:
+                            hardening = float(mat_props[k])
+                            break
+                        except Exception:
+                            hardening = 0.0
+                if not np.isfinite(hardening):
+                    hardening = 0.0
             except KeyError as exc:
                 raise KeyError(f"材料 '{mat_name}' 需要提供 E 与 nu。") from exc
         else:
@@ -162,6 +215,8 @@ def build_dfem_subcells(asm, part2mat, materials):
                     vol_list.append(vol)
                     lam_list.append(lam)
                     mu_list.append(mu)
+                    sigma_y_list.append(sigma_y)
+                    hardening_list.append(hardening)
 
                     dof_idx = []
                     for idx in idxs:
@@ -179,5 +234,7 @@ def build_dfem_subcells(asm, part2mat, materials):
         w=np.asarray(vol_list, dtype=np.float32),
         lam=np.asarray(lam_list, dtype=np.float32),
         mu=np.asarray(mu_list, dtype=np.float32),
+        sigma_y=np.asarray(sigma_y_list, dtype=np.float32),
+        hardening=np.asarray(hardening_list, dtype=np.float32),
         dof_idx=np.asarray(dof_idx_list, dtype=np.int32),
     )

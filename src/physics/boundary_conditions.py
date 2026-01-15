@@ -200,6 +200,29 @@ class BoundaryPenalty:
         }
         return E_bc, stats
 
+    def residual(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        """
+        Residual-only boundary term (no energy semantics).
+        Returns mean weighted squared residual.
+        """
+        if self.X is None or self.mask is None or self.u_target is None or self.w is None:
+            raise RuntimeError("[BoundaryPenalty] build_from_numpy must be called first.")
+
+        u = u_fn(self.X, params)
+        r_raw = (u - self.u_target) * self.mask
+        r2 = tf.reduce_sum(r_raw * r_raw, axis=1)
+
+        w = tf.cast(self.w, self.dtype)
+        denom = tf.reduce_sum(w) + tf.cast(1e-12, self.dtype)
+        L_bc = tf.reduce_sum(w * r2) / denom
+
+        abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))
+        stats = {
+            "bc_rms": tf.sqrt(tf.reduce_mean(abs_r * abs_r) + 1e-20),
+            "bc_max": tf.reduce_max(abs_r),
+        }
+        return L_bc, stats
+
     def update_multipliers(self, u_fn, params=None):
         """ALM 外层更新：λ ← λ + μ r，仅在 mode='alm' 时启用。"""
         if (self.cfg.mode or "penalty").lower() != "alm":

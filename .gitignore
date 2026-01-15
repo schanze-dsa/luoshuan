@@ -1,0 +1,18 @@
+# IDE
+.idea/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Outputs
+checkpoints/
+results/
+
+# Logs
+*.log
+*.err
+
+# Archives
+*.zip

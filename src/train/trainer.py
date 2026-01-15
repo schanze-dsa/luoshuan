@@ -19,7 +19,7 @@ import math
 import shutil
 from dataclasses import dataclass, field
 import inspect
-from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -54,7 +54,15 @@ def print(*values, sep: str = " ", end: str = "\n", file=None, flush: bool = Fal
     msg = sep.join(str(v) for v in values)
     if target in (sys.stdout, sys.stderr):
         msg = _wrap_white(msg)
-    _builtins.print(msg, end=end, file=target, flush=flush)
+    try:
+        _builtins.print(msg, end=end, file=target, flush=flush)
+    except UnicodeEncodeError:
+        # Windows consoles may use legacy encodings (e.g. GBK) and crash on
+        # special Unicode symbols. Keep Chinese text if possible, escape only
+        # the unencodable characters.
+        enc = getattr(target, "encoding", None) or "utf-8"
+        safe = msg.encode(enc, errors="backslashreplace").decode(enc, errors="ignore")
+        _builtins.print(safe, end=end, file=target, flush=flush)
 
 # 让 src 根目录可导入
 _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".", "."))
@@ -87,7 +95,8 @@ class TrainerConfig:
     mirror_surface_asm_key: Optional[str] = None   # e.g. 'ASM::"MIRROR up"'
 
     # 材料库（名字 -> (E, nu)）
-    materials: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
+    # - supports legacy tuple (E, nu) or dict {"E": ..., "nu": ...}
+    materials: Dict[str, Any] = field(default_factory=lambda: {
         "mirror": (70000.0, 0.33),
         "steel":  (210000.0, 0.30),
     })
@@ -118,6 +127,10 @@ class TrainerConfig:
     contact_mu_n_start: Optional[float] = None
     friction_k_t_start: Optional[float] = None
     friction_mu_t_start: Optional[float] = None
+    friction_smooth_schedule: bool = False     # True: 先平滑摩擦，后切换到严格 ALM
+    friction_smooth_fraction: float = 0.3      # 使用平滑摩擦的训练步数占比
+    friction_smooth_steps: Optional[int] = None  # 若给定则覆盖 fraction
+    friction_blend_steps: Optional[int] = None   # 平滑->严格 线性混合步数
 
     # 体积分点（弹性能量）RAR
     volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
@@ -154,6 +167,14 @@ class TrainerConfig:
     preload_use_stages: bool = False
     preload_randomize_order: bool = True
 
+    # incremental staged training (Mode A)
+    incremental_mode: bool = False
+    stage_inner_steps: int = 1            # backprop steps per stage
+    stage_alm_every: int = 1              # update ALM every N stages
+    stage_resample_contact: bool = False  # resample contact at each stage switch
+    reset_contact_state_per_case: bool = True
+    stage_schedule_steps: List[int] = field(default_factory=list)
+
     # 物理项/模型配置
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
     elas_cfg: ElasticityConfig = field(
@@ -162,7 +183,7 @@ class TrainerConfig:
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     preload_cfg: PreloadConfig = field(default_factory=PreloadConfig)
     total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
-        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0
+        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0, w_eq=0.0
     ))
 
     # 损失加权（自适应）
@@ -233,6 +254,10 @@ class TrainerConfig:
     viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
     viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
+    viz_plot_stages: bool = False           # preload_use_stages 时额外输出每个加载阶段的云图
+    viz_compare_cases: bool = True          # 固定6组云图后追加“差值云图/对比报告”
+    viz_compare_cmap: str = "coolwarm"      # 差值云图配色（建议发散色图）
+    viz_compare_common_scale: bool = True   # 追加同一色标(0~max)的可比云图
     save_best_on: str = "Pi"   # or "E_int"
 
     # 材料屈服强度（可选，用于日志中输出 σ_vm/σ_y 比值）；单位需与应力一致
@@ -269,6 +294,7 @@ class Trainer:
         self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
         self._contact_hardening_targets: Optional[Dict[str, float]] = None
+        self._friction_smooth_state: Optional[str] = None
 
         if cfg.preload_specs:
             self._set_preload_dim(len(cfg.preload_specs))
@@ -559,8 +585,11 @@ class Trainer:
             "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
             "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
             "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
+            "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
             "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
             "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
+            "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
+            "E_lock": getattr(self.cfg.total_cfg, "w_lock", 0.0),
         }
         if self.loss_state is not None:
             for key, value in self.loss_state.current.items():
@@ -592,8 +621,11 @@ class Trainer:
             ("E_cn", "Ecn"),
             ("E_ct", "Ect"),
             ("E_tie", "Etie"),
+            ("E_bc", "Ebc"),
             ("W_pre", "Wpre"),
+            ("E_lock", "Elock"),
             ("E_sigma", "Esig"),
+            ("E_eq", "Eeq"),
         ]
         aliases = {
             "E_cn": ("E_cn", "E_n"),
@@ -742,8 +774,8 @@ class Trainer:
             if gap_p01 is not None:
                 gap_terms.append(f"g01={gap_p01:.2e}")
             if mean_gap is not None:
-                gap_terms.append(f"⟨gap⟩={mean_gap:.2e}")
-            gap_disp = " ".join(gap_terms) if gap_terms else "⟨gap⟩=--"
+                gap_terms.append(f"gmean={mean_gap:.2e}")
+            gap_disp = " ".join(gap_terms) if gap_terms else "gmean=--"
 
             # Von Mises 应力及屈服比（若提供 yield_strength）
             vm_phys_max = _get_stat_float("stress_vm_phys_max")
@@ -850,6 +882,42 @@ class Trainer:
 
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
         nb = int(self._preload_dim)
+        repeat = max(1, int(getattr(self.cfg, "preload_sequence_repeat", 1) or 1))
+        if repeat > 1:
+            # Hold the same preload vector (and optionally the same tightening order)
+            # for a few consecutive optimization steps, so each sampled case has a
+            # chance to converge instead of being "seen once and forgotten".
+            if self._preload_current_target is None:
+                sampling = (self.cfg.preload_sampling or "uniform").lower()
+                if sampling == "lhs":
+                    out = self._next_lhs_preload(nb, lo, hi)
+                else:
+                    out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
+                self._preload_current_target = out.astype(np.float32).copy()
+
+                if self.cfg.preload_use_stages:
+                    if self.cfg.preload_randomize_order:
+                        self._preload_current_order = np.random.permutation(nb).astype(np.int32)
+                    else:
+                        self._preload_current_order = np.arange(nb, dtype=np.int32)
+                else:
+                    self._preload_current_order = None
+                self._preload_sequence_hold = 0
+
+            target = self._preload_current_target.copy()
+            current_order = (
+                None if self._preload_current_order is None else self._preload_current_order.copy()
+            )
+
+            self._preload_sequence_hold += 1
+            if self._preload_sequence_hold >= repeat:
+                self._preload_sequence_hold = 0
+                self._preload_current_target = None
+                self._preload_current_order = None
+
+            self._last_preload_order = None if current_order is None else current_order.copy()
+            return target.astype(np.float32)
+
         sampling = (self.cfg.preload_sampling or "uniform").lower()
         if sampling == "lhs":
             out = self._next_lhs_preload(nb, lo, hi)
@@ -894,6 +962,16 @@ class Trainer:
             onehot[idx_int] = 1.0
             stage_last.append(onehot)
             rank[idx_int] = float(pos)
+
+        mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        mode = mode.strip().lower().replace("-", "_")
+        if mode == "force_then_lock":
+            # Append a final "release" stage so the last stage represents the post-tightening
+            # equilibrium (all bolts locked, no active force control). This is where tightening
+            # order effects should manifest most clearly.
+            stage_loads.append(cumulative.copy())
+            stage_masks.append(mask.copy())
+            stage_last.append(np.zeros_like(P))
         if nb > 1:
             rank = rank / float(nb - 1)
         else:
@@ -972,6 +1050,22 @@ class Trainer:
             feat_dim += n_bolts
         if rank_tf is not None:
             feat_dim += n_bolts
+        tighten_time = None
+        if rank_tf is not None:
+            tighten_time = rank_tf
+        else:
+            try:
+                pos = tf.range(n_bolts, dtype=tf.float32)
+                rank_raw = tf.scatter_nd(tf.reshape(order_tf, (-1, 1)), pos, [n_bolts])
+                if n_bolts > 1:
+                    rank_raw = rank_raw / tf.cast(n_bolts - 1, tf.float32)
+                else:
+                    rank_raw = tf.zeros_like(rank_raw)
+                tighten_time = rank_raw
+            except Exception:
+                tighten_time = None
+        if tighten_time is not None:
+            feat_dim += 1 + n_bolts
 
         for idx in range(stage_count):
             p_stage = tf.convert_to_tensor(stages[idx], dtype=tf.float32)
@@ -983,6 +1077,15 @@ class Trainer:
                 feat_parts.append(last_tensor[idx])
             if rank_tf is not None:
                 feat_parts.append(rank_tf)
+            if tighten_time is not None:
+                if stage_count > 1:
+                    t_stage = tf.cast(idx, tf.float32) / tf.cast(stage_count - 1, tf.float32)
+                else:
+                    t_stage = tf.cast(0.0, tf.float32)
+                t_stage_vec = tf.reshape(t_stage, (1,))
+                delta_t = tf.maximum(tf.cast(0.0, tf.float32), t_stage - tighten_time)
+                feat_parts.append(t_stage_vec)
+                feat_parts.append(delta_t)
             features = tf.concat(feat_parts, axis=0)
             features.set_shape((feat_dim,))
             stage_params_P.append(p_stage)
@@ -1088,6 +1191,109 @@ class Trainer:
                 if key in params and key not in final:
                     final[key] = params[key]
         return final
+
+    def _extract_stage_params(
+        self, params: Dict[str, Any], stage_index: int, keep_context: bool = False
+    ) -> Dict[str, Any]:
+        """Return the indexed staged parameter set (0-based), optionally carrying context."""
+
+        if not (
+            self.cfg.preload_use_stages
+            and isinstance(params, dict)
+            and "stages" in params
+        ):
+            return params
+
+        stages = params["stages"]
+        out: Optional[Dict[str, Any]] = None
+        if isinstance(stages, dict) and stages:
+            stage_P = stages.get("P")
+            stage_feat = stages.get("P_hat")
+            if stage_P is not None and stage_feat is not None:
+                stage_count = 0
+                try:
+                    stage_count = int(stage_P.shape[0])
+                except Exception:
+                    stage_count = 0
+                if stage_count <= 0:
+                    stage_count = int(tf.shape(stage_P)[0].numpy())
+                idx = stage_index % stage_count
+                out = {"P": stage_P[idx], "P_hat": stage_feat[idx]}
+
+                rank_tensor = stages.get("stage_rank")
+                if rank_tensor is not None:
+                    if getattr(rank_tensor, "shape", None) is not None and rank_tensor.shape.rank == 2:
+                        out["stage_rank"] = rank_tensor[idx]
+                    else:
+                        out["stage_rank"] = rank_tensor
+
+                mask_tensor = stages.get("stage_mask")
+                if mask_tensor is not None and getattr(mask_tensor, "shape", None) is not None and mask_tensor.shape.rank == 2:
+                    out["stage_mask"] = mask_tensor[idx]
+
+                last_tensor = stages.get("stage_last")
+                if last_tensor is not None and getattr(last_tensor, "shape", None) is not None and last_tensor.shape.rank == 2:
+                    out["stage_last"] = last_tensor[idx]
+        elif isinstance(stages, (list, tuple)) and stages:
+            idx = stage_index % len(stages)
+            stage_item = stages[idx]
+            if isinstance(stage_item, dict):
+                out = dict(stage_item)
+            else:
+                p_val, z_val = stage_item
+                out = {"P": p_val, "P_hat": z_val}
+
+        if out is None:
+            return params
+
+        if keep_context:
+            for key in (
+                "stage_order",
+                "stage_rank",
+                "stage_count",
+            ):
+                if key in params and key not in out:
+                    out[key] = params[key]
+        return out
+
+    def _get_stage_count(self, params: Dict[str, Any]) -> int:
+        """Infer stage count from params; falls back to 1."""
+        if not (self.cfg.preload_use_stages and isinstance(params, dict) and "stages" in params):
+            return 1
+        stages = params["stages"]
+        if isinstance(stages, dict) and stages:
+            stage_P = stages.get("P")
+            if stage_P is not None:
+                try:
+                    return int(stage_P.shape[0])
+                except Exception:
+                    try:
+                        return int(tf.shape(stage_P)[0].numpy())
+                    except Exception:
+                        return 1
+        if isinstance(stages, (list, tuple)):
+            return max(1, len(stages))
+        return 1
+
+    def _active_stage_count(self, step: Optional[int], stage_count: int) -> int:
+        """Determine how many stages to include based on a schedule."""
+        if step is None or stage_count <= 1:
+            return stage_count
+        schedule = getattr(self.cfg, "stage_schedule_steps", None) or []
+        if not schedule or len(schedule) < stage_count:
+            return stage_count
+        cum = 0
+        for idx, span in enumerate(schedule[:stage_count]):
+            try:
+                span_i = int(span)
+            except Exception:
+                span_i = 0
+            if span_i <= 0:
+                continue
+            cum += span_i
+            if step <= cum:
+                return idx + 1
+        return stage_count
 
     def _make_warmup_case(self) -> Dict[str, np.ndarray]:
         mid = 0.5 * (float(self.cfg.preload_min) + float(self.cfg.preload_max))
@@ -1230,7 +1436,18 @@ class Trainer:
             self.w_vol = w_vol
             self.mat_id = mat_id
             self.enum_names = enum_names
-            self.id2props_map = {i: tuple(map(float, cfg.materials[name])) for i, name in enumerate(enum_names)}
+            def _extract_E_nu(tag: str, spec: Any) -> Tuple[float, float]:
+                if isinstance(spec, (tuple, list)) and len(spec) >= 2:
+                    return float(spec[0]), float(spec[1])
+                if isinstance(spec, dict):
+                    return float(spec["E"]), float(spec["nu"])
+                raise TypeError(
+                    f"[trainer] Material '{tag}' spec must be (E, nu) or dict with keys 'E'/'nu', got {type(spec)}"
+                )
+
+            self.id2props_map = {
+                i: _extract_E_nu(name, cfg.materials[name]) for i, name in enumerate(enum_names)
+            }
 
             pb.update(1)
 
@@ -1357,7 +1574,9 @@ class Trainer:
                 except Exception as exc:
                     print(f"[graph] 预计算全局邻接失败，将退回动态构图：{exc}")
             base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
-            if cfg.mixed_precision:
+            mp_policy = str(cfg.mixed_precision or "").strip().lower()
+            use_loss_scale = mp_policy.startswith("mixed_")
+            if use_loss_scale:
                 base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
                 print("[trainer] 已启用 LossScaleOptimizer 以配合混合精度训练。")
             self.optimizer = base_optimizer
@@ -1502,6 +1721,65 @@ class Trainer:
             self.contact.friction.mu_t.assign(mu_t)
         except Exception:
             pass
+
+    def _maybe_update_friction_smoothing(self, step: int):
+        """Switch friction energy from smooth to strict according to schedule."""
+
+        if self.contact is None or not self.cfg.friction_smooth_schedule:
+            return
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if loss_mode in {"residual", "residual_only", "res"}:
+            return
+
+        smooth_steps = self.cfg.friction_smooth_steps
+        if smooth_steps is None or smooth_steps <= 0:
+            frac = float(np.clip(self.cfg.friction_smooth_fraction, 0.0, 1.0))
+            smooth_steps = int(max(0, frac * max(1, self.cfg.max_steps)))
+
+        blend_steps = self.cfg.friction_blend_steps
+        if blend_steps is None or blend_steps < 0:
+            blend_steps = 0
+
+        if smooth_steps <= 0:
+            blend = 0.0
+        elif step <= smooth_steps:
+            blend = 1.0
+        elif blend_steps > 0 and step <= smooth_steps + blend_steps:
+            t = float(step - smooth_steps) / float(blend_steps)
+            blend = max(0.0, min(1.0, 1.0 - t))
+        else:
+            blend = 0.0
+
+        if blend >= 0.999:
+            mode = "smooth"
+        elif blend <= 0.001:
+            mode = "strict"
+        else:
+            mode = "blend"
+
+        if self._friction_smooth_state is not None and mode == self._friction_smooth_state:
+            # still update blend value even if mode unchanged
+            pass
+
+        self._friction_smooth_state = mode
+        try:
+            use_smooth = blend > 0.0
+            if hasattr(self.contact.friction, "set_smooth_friction"):
+                self.contact.friction.set_smooth_friction(use_smooth)
+            else:
+                self.contact.friction.cfg.use_smooth_friction = use_smooth
+            if hasattr(self.contact.friction, "set_smooth_blend"):
+                self.contact.friction.set_smooth_blend(blend)
+            else:
+                self.contact.friction.cfg.smooth_blend = float(blend)
+            self.contact.cfg.use_smooth_friction = use_smooth
+        except Exception:
+            pass
+
+        if mode == "blend":
+            print(f"[friction] 切换摩擦能量路径: blend ({blend:.2f}) (step {step})")
+        else:
+            print(f"[friction] 切换摩擦能量路径: {mode} (step {step})")
 
     # ----------------- Contact-driven RAR -----------------
 
@@ -1665,6 +1943,33 @@ class Trainer:
 
         note = f"RAR {len(rar_indices)}/{total_n}"
         return cat_new, note
+
+    def _resample_contact(self, step_index: int) -> str:
+        """Resample contact points and rebuild the contact operator."""
+        if self.contact is None:
+            self._contact_rar_cache = None
+            return "skip (no contact)"
+        try:
+            cmap = resample_contact_map(
+                self.asm,
+                self._cp_specs,
+                self.cfg.n_contact_points_per_pair,
+                base_seed=self.cfg.contact_seed,
+                step_index=step_index,
+            )
+            cat_uniform = cmap.concatenate()
+            cat, rar_note = self._maybe_apply_contact_rar(cat_uniform, step_index)
+            self.contact.reset_for_new_batch()
+            self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
+            self._current_contact_cat = cat
+            note = f"更新 {len(cmap)} 点"
+            if rar_note:
+                note += f" | {rar_note}"
+            return note
+        except Exception as exc:
+            self._contact_rar_cache = None
+            print(f"[contact] 重采样失败: {exc}")
+            return "更新失败"
 
     # ----------------- Volume (strain energy) RAR -----------------
 
@@ -1856,6 +2161,61 @@ class Trainer:
         loss = Pi + reg
         return loss, Pi, parts, stats
 
+    def _compute_total_loss_incremental(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        locked_deltas: Optional[tf.Tensor] = None,
+        force_then_lock: bool = False,
+        adaptive: bool = True,
+    ):
+        """Compute loss for a single stage with optional lock penalty."""
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        _, parts, stats = total.energy(
+            self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+        )
+
+        # Optional lock penalty for force_then_lock
+        E_lock = None
+        if force_then_lock and locked_deltas is not None:
+            preload_stats = stats.get("preload") or stats.get("preload_stats")
+            stage_mask = params.get("stage_mask")
+            stage_last = params.get("stage_last")
+            if (
+                isinstance(preload_stats, Mapping)
+                and preload_stats.get("bolt_deltas") is not None
+                and stage_mask is not None
+                and stage_last is not None
+            ):
+                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
+                lock_mask = tf.clip_by_value(
+                    tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
+                )
+                res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
+                E_lock = tf.reduce_sum(res * res)
+                parts["E_lock"] = E_lock
+
+        if E_lock is None and "E_lock" not in parts:
+            parts["E_lock"] = tf.cast(0.0, tf.float32)
+
+        Pi = total._combine_parts(parts)
+        if self.loss_state is not None:
+            if adaptive:
+                update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
+            Pi = combine_loss(parts, self.loss_state)
+        reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+        loss = Pi + reg
+        return loss, Pi, parts, stats
+
     def _tie_preload_weight_to_internal(self) -> None:
         """
         Keep the external preload work term on the same scale as the internal energy term.
@@ -1868,6 +2228,9 @@ class Trainer:
 
         state = self.loss_state
         if state is None:
+            return
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if loss_mode in {"residual", "residual_only", "res"}:
             return
 
         focus_terms = getattr(state, "focus_terms", tuple()) or tuple()
@@ -1900,11 +2263,23 @@ class Trainer:
         if min_w is not None:
             new_pre = max(float(min_w), new_pre)
         if max_w is not None:
-            new_pre = min(float(max_w), new_pre)
+            # Match LossWeightState.from_config(): allow base weights to exceed the
+            # global max bound by treating the base as a per-term ceiling.
+            base_cap = float(state.base.get("W_pre", new_pre) or new_pre)
+            eff_max = max(float(max_w), base_cap)
+            new_pre = min(eff_max, new_pre)
         state.current["W_pre"] = float(new_pre)
 
     # 请用此代码完全覆盖 src/train/trainer.py 中的 _train_step 方法
-    def _train_step(self, total, preload_case: Dict[str, np.ndarray]):
+    def _train_step(
+        self,
+        total,
+        preload_case: Dict[str, np.ndarray],
+        *,
+        step: Optional[int] = None,
+    ):
+        if bool(getattr(self.cfg, "incremental_mode", False)):
+            return self._train_step_incremental(total, preload_case, step=step)
         model = self.model
         opt = self.optimizer
         train_vars = self._collect_trainable_variables()
@@ -1924,6 +2299,9 @@ class Trainer:
                 scaled_loss = opt.get_scaled_loss(loss)
 
         # 4) 反传 & 梯度缩放
+        step_txt = "" if step is None else f" step={step}"
+        loss_val = float(tf.cast(loss, tf.float32).numpy())
+        loss_finite = bool(np.isfinite(loss_val))
         if use_loss_scale:
             scaled_grads = tape.gradient(scaled_loss, train_vars)
             grads = opt.get_unscaled_gradients(scaled_grads)
@@ -1939,10 +2317,21 @@ class Trainer:
         non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
         g_list, v_list = zip(*non_none)
         grad_norm = self._safe_global_norm(g_list)
+        grad_norm_val = float(grad_norm.numpy())
+        grad_norm_finite = bool(np.isfinite(grad_norm_val))
 
-        clip_norm = getattr(self, "clip_grad_norm", None) or getattr(self.cfg, "clip_grad_norm", None)
-        if clip_norm is not None and float(clip_norm) > 0.0:
+        clip_norm = (
+            getattr(self, "clip_grad_norm", None)
+            or getattr(self, "grad_clip_norm", None)
+            or getattr(self.cfg, "clip_grad_norm", None)
+            or getattr(self.cfg, "grad_clip_norm", None)
+        )
+        if clip_norm is not None and float(clip_norm) > 0.0 and grad_norm_finite:
             g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
+
+        # 不因 NaN/Inf 直接中止训练：跳过本次权重更新，避免 NaN 梯度污染网络权重。
+        if (not loss_finite) or (not grad_norm_finite):
+            return Pi, parts, stats, grad_norm
 
         apply_kwargs = {}
         try:
@@ -1957,6 +2346,156 @@ class Trainer:
 
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
+
+    def _train_step_incremental(
+        self,
+        total,
+        preload_case: Dict[str, np.ndarray],
+        *,
+        step: Optional[int] = None,
+    ):
+        """Incremental Mode A: solve stages sequentially with per-stage updates."""
+        model = self.model
+        opt = self.optimizer
+        train_vars = self._collect_trainable_variables()
+
+        params_full = self._make_preload_params(preload_case)
+        stage_count = self._get_stage_count(params_full)
+        active_count = self._active_stage_count(step, stage_count)
+
+        stage_mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        force_then_lock = stage_mode == "force_then_lock"
+
+        if self.contact is not None and self.cfg.reset_contact_state_per_case:
+            self.contact.reset_multipliers(reset_reference=True)
+
+        locked_deltas: Optional[tf.Tensor] = None
+        stage_inner_steps = max(1, int(getattr(self.cfg, "stage_inner_steps", 1)))
+        stage_alm_every = max(1, int(getattr(self.cfg, "stage_alm_every", 1)))
+        use_delta_st = bool(getattr(self.contact.friction.cfg, "use_delta_st", False)) if self.contact else False
+
+        Pi = tf.constant(0.0, dtype=tf.float32)
+        parts: Dict[str, tf.Tensor] = {}
+        stats: Dict[str, Any] = {}
+        grad_norm = tf.constant(0.0, dtype=tf.float32)
+
+        for stage_idx in range(active_count):
+            stage_params = self._extract_stage_params(params_full, stage_idx, keep_context=True)
+            if force_then_lock:
+                stage_last = stage_params.get("stage_last")
+                if stage_last is not None and "P" in stage_params:
+                    P_cum = tf.convert_to_tensor(stage_params["P"], dtype=tf.float32)
+                    stage_params = dict(stage_params)
+                    stage_params["P_cumulative"] = P_cum
+                    stage_params["P"] = P_cum * tf.cast(stage_last, P_cum.dtype)
+
+            prev_params = None
+            if self.contact is not None and use_delta_st and stage_idx > 0:
+                prev_params = self._extract_stage_params(
+                    params_full, stage_idx - 1, keep_context=True
+                )
+                if force_then_lock:
+                    prev_last = prev_params.get("stage_last")
+                    if prev_last is not None and "P" in prev_params:
+                        P_cum_prev = tf.convert_to_tensor(prev_params["P"], dtype=tf.float32)
+                        prev_params = dict(prev_params)
+                        prev_params["P_cumulative"] = P_cum_prev
+                        prev_params["P"] = P_cum_prev * tf.cast(prev_last, P_cum_prev.dtype)
+
+            # Stage-wise contact resampling (keep fixed within stage)
+            if self.contact is not None and self.cfg.stage_resample_contact:
+                seed = int((step or 0) * 100 + (stage_idx + 1))
+                self._resample_contact(seed)
+            if prev_params is not None:
+                u_nodes = None
+                if self.elasticity is not None:
+                    u_nodes = self.elasticity._eval_u_on_nodes(self.model.u_fn, prev_params)
+                self.contact.friction.capture_reference(
+                    self.model.u_fn, prev_params, u_nodes=u_nodes
+                )
+
+            for _ in range(stage_inner_steps):
+                with tf.GradientTape() as tape:
+                    loss, Pi, parts, stats = self._compute_total_loss_incremental(
+                        total,
+                        stage_params,
+                        locked_deltas=locked_deltas,
+                        force_then_lock=force_then_lock,
+                        adaptive=True,
+                    )
+                    use_loss_scale = hasattr(opt, "get_scaled_loss")
+                    if use_loss_scale:
+                        scaled_loss = opt.get_scaled_loss(loss)
+
+                if use_loss_scale:
+                    scaled_grads = tape.gradient(scaled_loss, train_vars)
+                    grads = opt.get_unscaled_gradients(scaled_grads)
+                else:
+                    grads = tape.gradient(loss, train_vars)
+
+                if not any(g is not None for g in grads):
+                    raise RuntimeError(
+                        "[trainer] All gradients are None in incremental step."
+                    )
+
+                non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
+                g_list, v_list = zip(*non_none)
+                grad_norm = self._safe_global_norm(g_list)
+                grad_norm_val = float(grad_norm.numpy())
+                grad_norm_finite = bool(np.isfinite(grad_norm_val))
+
+                clip_norm = (
+                    getattr(self, "clip_grad_norm", None)
+                    or getattr(self, "grad_clip_norm", None)
+                    or getattr(self.cfg, "clip_grad_norm", None)
+                    or getattr(self.cfg, "grad_clip_norm", None)
+                )
+                if clip_norm is not None and float(clip_norm) > 0.0 and grad_norm_finite:
+                    g_list = self._safe_clip_by_global_norm(g_list, clip_norm, grad_norm)
+
+                loss_val = float(tf.cast(loss, tf.float32).numpy())
+                if not (np.isfinite(loss_val) and grad_norm_finite):
+                    continue
+
+                apply_kwargs = {}
+                try:
+                    sig = inspect.signature(opt.apply_gradients)
+                    if "experimental_aggregate_gradients" in sig.parameters:
+                        apply_kwargs["experimental_aggregate_gradients"] = False
+                except (TypeError, ValueError):
+                    apply_kwargs = {}
+
+                opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
+
+            # Stage ALM update (once per stage by default)
+            if stage_alm_every > 0 and ((stage_idx + 1) % stage_alm_every == 0):
+                total.update_multipliers(self.model.u_fn, params=stage_params)
+
+            # Update locked deltas for force-then-lock
+            preload_stats = stats.get("preload") or stats.get("preload_stats")
+            stage_last = stage_params.get("stage_last")
+            if (
+                force_then_lock
+                and stage_last is not None
+                and isinstance(preload_stats, Mapping)
+                and preload_stats.get("bolt_deltas") is not None
+            ):
+                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
+                if locked_deltas is None:
+                    locked_deltas = tf.zeros_like(bolt_deltas)
+                last_vec = tf.cast(stage_last, tf.float32)
+                locked_deltas = (
+                    last_vec * tf.stop_gradient(bolt_deltas)
+                    + (1.0 - last_vec) * locked_deltas
+                )
+
+            # Commit friction reference for delta slip between stages
+            if use_delta_st and self.contact is not None:
+                self.contact.friction.commit_reference()
+
+        return Pi, parts, stats, grad_norm
+
     def _flatten_tensor_list(
         self, tensors: Sequence[Optional[tf.Tensor]], sizes: Sequence[int]
     ) -> tf.Tensor:
@@ -2143,14 +2682,24 @@ class Trainer:
             "E_cn": self.cfg.total_cfg.w_cn,
             "E_ct": self.cfg.total_cfg.w_ct,
             "E_tie": self.cfg.total_cfg.w_tie,
+            "E_bc": self.cfg.total_cfg.w_bc,
             "W_pre": self.cfg.total_cfg.w_pre,
             "E_sigma": self.cfg.total_cfg.w_sigma,
+            "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
+            "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
+            "E_lock": getattr(self.cfg.total_cfg, "w_lock", 0.0),
+            "path_penalty_total": getattr(self.cfg.total_cfg, "path_penalty_weight", 0.0),
+            "fric_path_penalty_total": getattr(self.cfg.total_cfg, "fric_path_penalty_weight", 0.0),
             # 残差项默认权重为 0，需要的话再在 config 里改
             "R_fric_comp": 0.0,
             "R_contact_comp": 0.0,
         }
 
         adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
+        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+        sign_overrides = None
+        if loss_mode in {"residual", "residual_only", "res"}:
+            sign_overrides = {"W_pre": 1.0}
         if adaptive_enabled:
             scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
             focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
@@ -2165,6 +2714,7 @@ class Trainer:
                 gamma=getattr(self.cfg, "loss_gamma", 2.0),
                 focus_terms=focus_terms,
                 update_every=getattr(self.cfg, "loss_update_every", 1),
+                sign_overrides=sign_overrides,
             )
         else:
             self.loss_state = None
@@ -2190,45 +2740,25 @@ class Trainer:
                         contact_note = "跳过 (无接触体)"
                         self._contact_rar_cache = None
                     else:
-                        should_resample = step == 1
-                        if not should_resample and self.cfg.resample_contact_every > 0:
-                            should_resample = (
-                                (step - 1) % self.cfg.resample_contact_every == 0
-                            )
-
-                        if should_resample:
-                            try:
-                                cmap = resample_contact_map(
-                                    self.asm,
-                                    self._cp_specs,
-                                    self.cfg.n_contact_points_per_pair,
-                                    base_seed=self.cfg.contact_seed,
-                                    step_index=step,
-                                )
-                                cat_uniform = cmap.concatenate()
-                                cat, rar_note = self._maybe_apply_contact_rar(
-                                    cat_uniform, step
-                                )
-                                self.contact.reset_for_new_batch()
-                                self.contact.build_from_cat(
-                                    cat, extra_weights=None, auto_orient=True
-                                )
-                                self._current_contact_cat = cat
-                                contact_note = f"更新 {len(cmap)} 点"
-                                if rar_note:
-                                    contact_note += f" | {rar_note}"
-                            except Exception as exc:
-                                contact_note = "更新失败"
-                                self._contact_rar_cache = None
-                                print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
+                        if self.cfg.incremental_mode and self.cfg.stage_resample_contact:
+                            contact_note = "阶段内重采样"
                         else:
-                            if self.cfg.resample_contact_every <= 0:
-                                contact_note = "跳过 (沿用首步采样)"
-                            else:
-                                remaining = self.cfg.resample_contact_every - (
-                                    (step - 1) % self.cfg.resample_contact_every
+                            should_resample = step == 1
+                            if not should_resample and self.cfg.resample_contact_every > 0:
+                                should_resample = (
+                                    (step - 1) % self.cfg.resample_contact_every == 0
                                 )
-                                contact_note = f"跳过 (距下次还有 {remaining} 步)"
+
+                            if should_resample:
+                                contact_note = self._resample_contact(step)
+                            else:
+                                if self.cfg.resample_contact_every <= 0:
+                                    contact_note = "跳过 (沿用首步采样)"
+                                else:
+                                    remaining = self.cfg.resample_contact_every - (
+                                        (step - 1) % self.cfg.resample_contact_every
+                                    )
+                                    contact_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("resample", elapsed))
                     self._set_pbar_postfix(
@@ -2243,11 +2773,12 @@ class Trainer:
                     preload_case = self._sample_preload_case()
                     # 动态提升接触惩罚/ALM 参数（软→硬）
                     self._maybe_update_contact_hardening(step)
+                    self._maybe_update_friction_smoothing(step)
                     vol_note = ""
                     if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
                         vol_indices, vol_note = self._maybe_apply_volume_rar(step)
                         self.elasticity.set_sample_indices(vol_indices)
-                    Pi, parts, stats, grad_norm = self._train_step(total, preload_case)
+                    Pi, parts, stats, grad_norm = self._train_step(total, preload_case, step=step)
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
                     self._last_preload_case = copy.deepcopy(preload_case)
@@ -2306,6 +2837,8 @@ class Trainer:
                     alm_note = "跳过"
                     if self.contact is None:
                         alm_note = "跳过 (无接触体)"
+                    elif self.cfg.incremental_mode:
+                        alm_note = "跳过 (incremental)"
                     elif self.cfg.alm_update_every <= 0:
                         alm_note = "跳过 (已禁用)"
                     elif step % self.cfg.alm_update_every == 0:
@@ -2420,10 +2953,16 @@ class Trainer:
             raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
 
         n_bolts = max(1, len(self.cfg.preload_specs) or 3)
+        stage_mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        append_release_stage = bool(
+            self.cfg.preload_use_stages and stage_mode == "force_then_lock"
+        )
 
         module = _SavedModelModule(
             model=self.model,
             use_stages=bool(self.cfg.preload_use_stages),
+            append_release_stage=append_release_stage,
             shift=float(self.cfg.model_cfg.preload_shift),
             scale=float(self.cfg.model_cfg.preload_scale),
             n_bolts=n_bolts,
@@ -2482,8 +3021,7 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
-            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
-            remove_rigid=True,
+            remove_rigid=self.cfg.viz_remove_rigid,
             diag_out=diag_out,
         )
         return result
@@ -2523,12 +3061,18 @@ class Trainer:
         if self.asm is None or self.model is None:
             return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        cases = self._fixed_viz_preload_cases()
+        cases = None
+        if self._last_preload_case is not None:
+            cases = [copy.deepcopy(self._last_preload_case)]
+            print("[viz] Using last training preload case for visualization.")
+        else:
+            cases = self._fixed_viz_preload_cases()
         n_total = len(cases) if cases else n_samples
         print(
             f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
         )
         iter_cases = cases if cases else [self._sample_preload_case() for _ in range(n_samples)]
+        viz_records: List[Dict[str, Any]] = []
         for i, preload_case in enumerate(iter_cases):
             P = preload_case["P"]
             order_display = None
@@ -2545,6 +3089,39 @@ class Trainer:
             )
             params_full = self._make_preload_params(preload_case)
             params_eval = self._extract_final_stage_params(params_full, keep_context=True)
+
+            # Write a compact bolt-delta report next to the figure so tightening order
+            # effects can be inspected numerically without opening the plots.
+            if self.preload is not None and save_path:
+                try:
+                    bolt_report_path = os.path.splitext(save_path)[0] + "_bolts.txt"
+                    stage_rows = []
+                    if (
+                        self.cfg.preload_use_stages
+                        and isinstance(preload_case, dict)
+                        and "stages" in preload_case
+                    ):
+                        stages_np = np.asarray(preload_case.get("stages"), dtype=np.float32)
+                        if stages_np.ndim == 2 and stages_np.shape[0] > 0:
+                            for s in range(int(stages_np.shape[0])):
+                                params_s = self._extract_stage_params(params_full, s, keep_context=True)
+                                _, st = self.preload.energy(self.model.u_fn, params_s)
+                                stage_rows.append(
+                                    np.asarray(st.get("preload", {}).get("bolt_deltas", []))
+                                )
+                    _, st_final = self.preload.energy(self.model.u_fn, params_eval)
+                    final_row = np.asarray(st_final.get("preload", {}).get("bolt_deltas", []))
+
+                    with open(bolt_report_path, "w", encoding="utf-8") as fp:
+                        fp.write(f"P = {P.tolist()}  [N]\n")
+                        if self.cfg.preload_use_stages and "order" in preload_case:
+                            fp.write(f"order = {preload_case['order'].tolist()}  (0-based)\n")
+                        fp.write("bolt_deltas = [Δ1, Δ2, Δ3]  [mm]\n")
+                        for s, row in enumerate(stage_rows, start=1):
+                            fp.write(f"stage_{s}: {row.tolist()}\n")
+                        fp.write(f"final: {final_row.tolist()}\n")
+                except Exception as exc:
+                    print(f"[viz] bolt delta report skipped: {exc}")
             try:
                 _, _, data_path = self._call_viz(P, params_eval, save_path, title)
                 if self.cfg.viz_surface_enabled:
@@ -2561,10 +3138,371 @@ class Trainer:
                         print(f"[viz] saved -> {save_path}")
                     if data_path:
                         print(f"[viz] displacement data -> {data_path}")
+                viz_records.append(
+                    {
+                        "index": i + 1,
+                        "P": np.asarray(P, dtype=np.float64).reshape(-1),
+                        "order": None if "order" not in preload_case else preload_case.get("order"),
+                        "order_display": order_display,
+                        "png_path": save_path,
+                        "data_path": data_path,
+                        "mesh_path": (
+                            os.path.splitext(save_path)[0] + "_surface.ply"
+                            if self.cfg.viz_write_surface_mesh and save_path
+                            else None
+                        ),
+                    }
+                )
             except TypeError as e:
                 print("[viz] signature mismatch:", e)
             except Exception as e:
                 print("[viz] error:", e)
+
+            # Optional: plot each preload stage to make tightening order visible.
+            if (
+                self.cfg.viz_plot_stages
+                and self.cfg.preload_use_stages
+                and isinstance(preload_case, dict)
+                and "stages" in preload_case
+            ):
+                try:
+                    stages_np = np.asarray(preload_case.get("stages"), dtype=np.float32)
+                    if stages_np.ndim == 2 and stages_np.shape[0] > 1:
+                        for s in range(int(stages_np.shape[0])):
+                            P_stage = stages_np[s]
+                            title_s = f"{self.cfg.viz_title_prefix}  P=[{int(P_stage[0])},{int(P_stage[1])},{int(P_stage[2])}]N"
+                            if order_display:
+                                title_s += f"  (order={order_display})"
+                            title_s += f"  (stage={s+1}/{int(stages_np.shape[0])})"
+                            save_path_s = os.path.join(
+                                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}_s{s+1}.png"
+                            )
+                            params_s = self._extract_stage_params(params_full, s, keep_context=True)
+                            self._call_viz(P_stage, params_s, save_path_s, title_s)
+                except Exception as exc:
+                    print(f"[viz] stage plots skipped: {exc}")
+
+        # Additional comparison outputs: common-scale maps and delta maps between cases.
+        if cases and viz_records and len(viz_records) > 1 and self.cfg.viz_compare_cases:
+            try:
+                self._write_viz_comparison(viz_records)
+            except Exception as exc:
+                print(f"[viz] comparison skipped: {exc}")
+
+    @staticmethod
+    def _read_viz_samples(path: str) -> Optional[Dict[str, Any]]:
+        if not path or not os.path.exists(path):
+            return None
+
+        node_ids: List[int] = []
+        ux: List[float] = []
+        uy: List[float] = []
+        uz: List[float] = []
+        umag: List[float] = []
+        u_plane: List[float] = []
+        v_plane: List[float] = []
+        rigid_line: Optional[str] = None
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    if "rigid_body_removed" in line:
+                        rigid_line = line
+                    continue
+                cols = line.split()
+                if len(cols) < 10:
+                    continue
+                try:
+                    node_ids.append(int(cols[0]))
+                    ux.append(float(cols[4]))
+                    uy.append(float(cols[5]))
+                    uz.append(float(cols[6]))
+                    umag.append(float(cols[7]))
+                    u_plane.append(float(cols[8]))
+                    v_plane.append(float(cols[9]))
+                except Exception:
+                    continue
+
+        if not node_ids:
+            return None
+
+        node_arr = np.asarray(node_ids, dtype=np.int64)
+        order = np.argsort(node_arr)
+        return {
+            "node_id": node_arr[order],
+            "ux": np.asarray(ux, dtype=np.float64)[order],
+            "uy": np.asarray(uy, dtype=np.float64)[order],
+            "uz": np.asarray(uz, dtype=np.float64)[order],
+            "umag": np.asarray(umag, dtype=np.float64)[order],
+            "u_plane": np.asarray(u_plane, dtype=np.float64)[order],
+            "v_plane": np.asarray(v_plane, dtype=np.float64)[order],
+            "rigid_line": rigid_line,
+        }
+
+    def _write_viz_comparison(self, records: List[Dict[str, Any]]) -> None:
+        """
+        Generate:
+        - common-scale |u| maps to make amplitude comparable
+        - delta maps (vector displacement difference) to highlight subtle differences
+        - a text report with quantitative metrics
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.tri import Triangulation
+        from matplotlib import colors
+
+        def _read_surface_ply_mesh(path: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+            if not path or not os.path.exists(path):
+                return None
+            n_vert = None
+            n_face = None
+            header_done = False
+            node_ids: List[int] = []
+            tris: List[Tuple[int, int, int]] = []
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if not header_done:
+                        if s.startswith("element vertex"):
+                            parts = s.split()
+                            if len(parts) >= 3:
+                                n_vert = int(parts[2])
+                        elif s.startswith("element face"):
+                            parts = s.split()
+                            if len(parts) >= 3:
+                                n_face = int(parts[2])
+                        elif s == "end_header":
+                            header_done = True
+                            break
+                if not header_done or n_vert is None or n_face is None:
+                    return None
+
+                for _ in range(int(n_vert)):
+                    row = f.readline()
+                    if not row:
+                        return None
+                    cols = row.strip().split()
+                    if len(cols) < 4:
+                        return None
+                    node_ids.append(int(cols[3]))
+
+                for _ in range(int(n_face)):
+                    row = f.readline()
+                    if not row:
+                        break
+                    cols = row.strip().split()
+                    if len(cols) < 4:
+                        continue
+                    try:
+                        n = int(cols[0])
+                    except Exception:
+                        continue
+                    if n < 3:
+                        continue
+                    # Expect triangles; if not, take the first three vertices as a fallback.
+                    i0, i1, i2 = int(cols[1]), int(cols[2]), int(cols[3])
+                    tris.append((i0, i1, i2))
+
+            if not node_ids or not tris:
+                return None
+            return (
+                np.asarray(node_ids, dtype=np.int64),
+                np.asarray(tris, dtype=np.int32),
+            )
+
+        samples: List[Dict[str, Any]] = []
+        for rec in records:
+            data_path = rec.get("data_path")
+            if not data_path:
+                continue
+            s = self._read_viz_samples(str(data_path))
+            if s is None:
+                continue
+            s["record"] = rec
+            samples.append(s)
+
+        if len(samples) < 2:
+            return
+
+        # Use the first sample as the geometric base for triangulation/mapping.
+        geom_base = samples[0]
+        geom_base_rec = geom_base["record"]
+        base_nodes = geom_base["node_id"]
+
+        # Common scale across all cases (for |u| maps)
+        global_umax = 0.0
+        for s in samples:
+            global_umax = max(global_umax, float(np.nanmax(s["umag"])))
+        global_umax = float(global_umax) + 1e-16
+
+        # Triangulation in (u,v) plane for diff plots: prefer FE connectivity from the surface PLY.
+        u = np.asarray(geom_base["u_plane"], dtype=np.float64)
+        v = np.asarray(geom_base["v_plane"], dtype=np.float64)
+        tri = None
+        vertex_pos: Optional[np.ndarray] = None
+        mesh_info = _read_surface_ply_mesh(str(geom_base_rec.get("mesh_path") or ""))
+        if mesh_info is not None:
+            mesh_nodes, mesh_tris = mesh_info
+            pos = np.searchsorted(base_nodes, mesh_nodes)
+            ok = (
+                (pos >= 0)
+                & (pos < base_nodes.shape[0])
+                & (base_nodes[pos] == mesh_nodes)
+            )
+            if np.all(ok):
+                u_vert = u[pos]
+                v_vert = v[pos]
+                tri = Triangulation(u_vert, v_vert, triangles=mesh_tris)
+                vertex_pos = pos
+        if tri is None:
+            tri = Triangulation(u, v)
+            cu, cv = float(np.mean(u)), float(np.mean(v))
+            r = np.sqrt((u - cu) ** 2 + (v - cv) ** 2)
+            r_inner = float(np.nanmin(r)) * 1.02
+            r_outer = float(np.nanmax(r)) * 0.98
+            tris = np.asarray(tri.triangles, dtype=np.int64)
+            uc = u[tris].mean(axis=1)
+            vc = v[tris].mean(axis=1)
+            rc = np.sqrt((uc - cu) ** 2 + (vc - cv) ** 2)
+            tri.set_mask((rc < r_inner) | (rc > r_outer))
+
+        # Report
+        report_path = os.path.join(self.cfg.out_dir, "deflection_compare.txt")
+        with open(report_path, "w", encoding="utf-8") as fp:
+            fp.write("Deflection comparison report (PINN)\n")
+            fp.write(f"triangulation_base = deflection_{geom_base_rec.get('index', 1):02d}\n\n")
+            fp.write("Cases:\n")
+            for s in samples:
+                rec = s["record"]
+                idx = int(rec.get("index", 0))
+                P = rec.get("P")
+                order_disp = rec.get("order_display") or "-"
+                fp.write(
+                    f"- {idx:02d} P={P.tolist() if hasattr(P, 'tolist') else P} order={order_disp}"
+                )
+                if s.get("rigid_line"):
+                    fp.write(f" | {s['rigid_line'].lstrip('#').strip()}")
+                fp.write("\n")
+            fp.write("\nDiffs (grouped by identical P):\n")
+
+            # Common-scale maps (optional)
+            if self.cfg.viz_compare_common_scale:
+                for s in samples:
+                    rec = s["record"]
+                    idx = int(rec.get("index", 0))
+                    out_name = f"deflection_{idx:02d}_common.png"
+                    out_path = os.path.join(self.cfg.out_dir, out_name)
+                    umag_plot = (
+                        s["umag"] if vertex_pos is None else s["umag"][vertex_pos]
+                    )
+                    fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+                    sc = ax.tripcolor(
+                        tri,
+                        umag_plot,
+                        shading="gouraud",
+                        cmap=str(self.cfg.viz_colormap or "turbo"),
+                        norm=colors.Normalize(vmin=0.0, vmax=global_umax),
+                        edgecolors="none",
+                    )
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.92, pad=0.02)
+                    cbar.set_label(f"Total displacement magnitude [{self.cfg.viz_units}] (common scale)")
+                    ax.set_aspect("equal", adjustable="box")
+                    ax.set_xlabel("u (best-fit plane)")
+                    ax.set_ylabel("v (best-fit plane)")
+                    title = f"{self.cfg.viz_title_prefix} | common scale"
+                    P = rec.get("P")
+                    if P is not None and len(P) >= 3:
+                        title += f"  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
+                    od = rec.get("order_display")
+                    if od:
+                        title += f" (order={od})"
+                    ax.set_title(title)
+                    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+
+            # Delta plots/metrics: compare within each identical-P group so tightening order is directly visible.
+            def _key_from_P(rec: Dict[str, Any]) -> Tuple[int, ...]:
+                P = rec.get("P")
+                if P is None:
+                    return tuple()
+                arr = np.asarray(P, dtype=np.float64).reshape(-1)
+                return tuple(int(round(float(x))) for x in arr.tolist())
+
+            groups: Dict[Tuple[int, ...], List[Dict[str, Any]]] = {}
+            for s in samples:
+                rec = s["record"]
+                key = _key_from_P(rec)
+                groups.setdefault(key, []).append(s)
+
+            for key, group in sorted(groups.items(), key=lambda kv: kv[0]):
+                if len(group) < 2:
+                    continue
+                group = sorted(group, key=lambda s: int(s["record"].get("index", 0)))
+                base = group[0]
+                base_rec = base["record"]
+                base_idx = int(base_rec.get("index", 0))
+                fp.write(f"\nP={list(key)} base={base_idx:02d}:\n")
+
+                for s in group[1:]:
+                    rec = s["record"]
+                    idx = int(rec.get("index", 0))
+                    nodes = s["node_id"]
+                    if nodes.shape != base_nodes.shape or not np.all(nodes == base_nodes):
+                        fp.write(f"- {idx:02d}: node mismatch, skipped\n")
+                        continue
+
+                    dux = s["ux"] - base["ux"]
+                    duy = s["uy"] - base["uy"]
+                    duz = s["uz"] - base["uz"]
+                    du = np.sqrt(dux * dux + duy * duy + duz * duz)
+                    rms = float(np.sqrt(np.mean(du * du)))
+                    maxv = float(np.max(du))
+                    dmag = s["umag"] - base["umag"]
+                    max_abs_dmag = float(np.max(np.abs(dmag)))
+                    arg = int(np.argmax(du))
+                    node_max = int(nodes[arg])
+                    u_max = float(u[arg])
+                    v_max = float(v[arg])
+                    fp.write(
+                        f"- {idx:02d}: rms|du|={rms:.3e} max|du|={maxv:.3e} "
+                        f"max|Δ|u||={max_abs_dmag:.3e} @node={node_max} (u,v)=({u_max:.3f},{v_max:.3f})\n"
+                    )
+
+                    dmag_plot = dmag if vertex_pos is None else dmag[vertex_pos]
+                    vlim = float(np.max(np.abs(dmag_plot))) + 1e-16
+                    out_name = f"deflection_diff_{idx:02d}_minus_{base_idx:02d}.png"
+                    out_path = os.path.join(self.cfg.out_dir, out_name)
+                    fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+                    norm = colors.TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim)
+                    sc = ax.tripcolor(
+                        tri,
+                        dmag_plot,
+                        shading="gouraud",
+                        cmap=str(self.cfg.viz_compare_cmap or "coolwarm"),
+                        norm=norm,
+                        edgecolors="none",
+                    )
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.92, pad=0.02)
+                    cbar.set_label(f"Δ|u| [{self.cfg.viz_units}]")
+                    ax.set_aspect("equal", adjustable="box")
+                    ax.set_xlabel("u (best-fit plane)")
+                    ax.set_ylabel("v (best-fit plane)")
+                    title = f"Δ|u| vs base ({base_idx:02d})"
+                    P = rec.get("P")
+                    if P is not None and len(P) >= 3:
+                        title += f"  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
+                    od = rec.get("order_display")
+                    if od:
+                        title += f" (order={od})"
+                    ax.set_title(title)
+                    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+
+        print(f"[viz] comparison report -> {report_path}")
 
 
 class _SavedModelModule(tf.Module):
@@ -2575,11 +3513,14 @@ class _SavedModelModule(tf.Module):
         self,
         model: DisplacementModel,
         use_stages: bool,
+        append_release_stage: bool,
         shift: float,
         scale: float = 1.0,
         n_bolts: int = 3,
     ):
-        super().__init__(name="pinn_saved_model")
+        # Avoid zero-arg super() here: some TF/AutoGraph versions may attempt to
+        # convert __init__ and fail to resolve the implicit __class__ cell.
+        tf.Module.__init__(self, name="pinn_saved_model")
         # 1. 显式追踪子模块 (关键修复)
         # 将 DisplacementModel 的核心子层挂载到 self 上，确保 TF 能追踪到变量
         self.encoder = model.encoder
@@ -2591,24 +3532,25 @@ class _SavedModelModule(tf.Module):
         self._model = model
 
         self._use_stages = bool(use_stages)
+        self._append_release_stage = bool(append_release_stage)
         self._shift = tf.constant(shift, dtype=tf.float32)
         self._scale = tf.constant(scale, dtype=tf.float32)
         self._n_bolts = int(max(1, n_bolts))
 
     @tf.function(
         input_signature=[
-            tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-            tf.TensorSpec(shape=[None], dtype=tf.float32, name="P"),
+            tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="x"),
+            tf.TensorSpec(shape=[None], dtype=tf.float32, name="p"),
             tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
         ]
     )
-    def run(self, X, P, order):
+    def run(self, x, p, order):
         # 准备参数
-        params = self._prepare_params(P, order)
+        params = self._prepare_params(p, order)
         
         # 调用模型的前向传播
         # 由于 self._model.encoder 就是 self.encoder，变量是共享且被追踪的
-        return self._model.u_fn(X, params)
+        return self._model.u_fn(x, params)
 
     def _prepare_params(self, P, order):
         # 确保 P 是 1D
@@ -2650,14 +3592,15 @@ class _SavedModelModule(tf.Module):
         return order
 
     def _build_stage_tensors(self, P, order):
-        stage_count = self._n_bolts
+        stage_count_bolts = self._n_bolts
+        stage_count_total = stage_count_bolts + (1 if self._append_release_stage else 0)
         cumulative = tf.zeros_like(P)
         mask = tf.zeros_like(P)
         
         # 使用 TensorArray 动态构建序列
-        loads_ta = tf.TensorArray(tf.float32, size=stage_count)
-        masks_ta = tf.TensorArray(tf.float32, size=stage_count)
-        last_ta = tf.TensorArray(tf.float32, size=stage_count)
+        loads_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
+        masks_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
+        last_ta = tf.TensorArray(tf.float32, size=stage_count_bolts)
 
         def body(i, cum, mask_vec, loads, masks, lasts):
             # 获取当前步骤要拧的螺栓索引
@@ -2690,7 +3633,7 @@ class _SavedModelModule(tf.Module):
             return i + 1, cum, mask_vec, loads, masks, lasts
 
         _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
-            lambda i, *_: tf.less(i, stage_count),
+            lambda i, *_: tf.less(i, stage_count_bolts),
             body,
             (0, cumulative, mask, loads_ta, masks_ta, last_ta),
         )
@@ -2699,20 +3642,28 @@ class _SavedModelModule(tf.Module):
         stage_masks = masks_ta.stack()
         stage_last = last_ta.stack()
 
+        if self._append_release_stage:
+            # Final post-tightening stage: all bolts locked, no active force control.
+            stage_P = tf.concat([stage_P, tf.expand_dims(cumulative, axis=0)], axis=0)
+            stage_masks = tf.concat([stage_masks, tf.expand_dims(mask, axis=0)], axis=0)
+            stage_last = tf.concat(
+                [stage_last, tf.expand_dims(tf.zeros_like(P), axis=0)], axis=0
+            )
+
         # 构建 Rank 矩阵
         indices = tf.reshape(order, (-1, 1))
-        ranks = tf.cast(tf.range(stage_count), tf.float32)
+        ranks = tf.cast(tf.range(stage_count_bolts), tf.float32)
         rank_vec = tf.tensor_scatter_nd_update(
             tf.zeros((self._n_bolts,), tf.float32), indices, ranks
         )
-        if stage_count > 1:
-            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+        if stage_count_bolts > 1:
+            rank_vec = rank_vec / tf.cast(stage_count_bolts - 1, tf.float32)
         else:
             rank_vec = tf.zeros_like(rank_vec)
 
         # 拼接最终特征 P_hat
-        feats_ta = tf.TensorArray(tf.float32, size=stage_count)
-        for i in range(stage_count):
+        feats_ta = tf.TensorArray(tf.float32, size=stage_count_total)
+        for i in range(stage_count_total):
             # 归一化 P
             norm = (stage_P[i] - self._shift) / self._scale
             # 拼接: [NormP, Mask, Last, Rank]

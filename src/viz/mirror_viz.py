@@ -459,6 +459,10 @@ def _collect_boundary_loops(tris: np.ndarray) -> List[List[int]]:
                 break
             cur, prev = prev, nxt2
             if prev == loop[0]:
+                # Mark the closing edge as visited; otherwise a closed loop would be
+                # discovered twice (starting from the last unmarked boundary edge),
+                # which later confuses hole-masking logic and can blank the plot.
+                visited_edges.add((cur, prev))
                 break
         loops.append(loop)
     return loops
@@ -538,27 +542,56 @@ def _diagnose_blank_regions(
     )
 
 
-def _mask_tris_with_loops(tri: Triangulation, UV: np.ndarray, loops: List[List[int]]) -> np.ndarray:
-    """Return a mask for triangles outside the outer boundary or inside holes."""
+def _mask_tris_with_loops(tri: Triangulation, loops: List[np.ndarray]) -> np.ndarray:
+    """Return a mask for triangles outside the outer boundary or inside holes.
+
+    Args:
+        tri: Target triangulation whose triangles will be masked.
+        loops: Boundary loops in the same (u,v) coordinate system as ``tri``, each
+            provided as an array of shape (L,2). The largest loop is treated as
+            the outer boundary; remaining loops are treated as holes.
+    """
 
     if not loops:
         return np.zeros(tri.triangles.shape[0], dtype=bool)
 
     from matplotlib.path import Path
 
-    areas = [abs(_loop_area(UV, loop)) for loop in loops]
+    areas = []
+    loop_arrays: List[np.ndarray] = []
+    for loop in loops:
+        arr = np.asarray(loop, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+            continue
+        loop_arrays.append(arr)
+        # Signed polygon area in UV
+        area = 0.0
+        for i in range(arr.shape[0]):
+            x1, y1 = float(arr[i, 0]), float(arr[i, 1])
+            x2, y2 = float(arr[(i + 1) % arr.shape[0], 0]), float(arr[(i + 1) % arr.shape[0], 1])
+            area += x1 * y2 - x2 * y1
+        areas.append(abs(0.5 * area))
     if not areas:
         return np.zeros(tri.triangles.shape[0], dtype=bool)
 
     outer_idx = int(np.argmax(areas))
-    outer_loop = loops[outer_idx]
-    hole_loops = [loop for i, loop in enumerate(loops) if i != outer_idx]
+    outer_loop = loop_arrays[outer_idx]
+    hole_loops = [loop for i, loop in enumerate(loop_arrays) if i != outer_idx]
 
-    centroids = UV[tri.triangles].mean(axis=1)
-    mask = ~Path(UV[outer_loop]).contains_points(centroids)
+    tri_x = np.asarray(tri.x, dtype=np.float64)
+    tri_y = np.asarray(tri.y, dtype=np.float64)
+    tris = np.asarray(tri.triangles, dtype=np.int64)
+    centroids = np.stack(
+        [
+            tri_x[tris].mean(axis=1),
+            tri_y[tris].mean(axis=1),
+        ],
+        axis=1,
+    )
+    mask = ~Path(outer_loop).contains_points(centroids)
 
     for loop in hole_loops:
-        hole_path = Path(UV[loop])
+        hole_path = Path(loop)
         mask |= hole_path.contains_points(centroids)
 
     return mask
@@ -971,21 +1004,38 @@ def plot_mirror_deflection(asm: AssemblyModel,
 
     diag_result: Optional[BlankRegionDiagnostics] = None
     if render_surface and diagnose_blanks:
+        # Note: when refinement is enabled, refined samples are generated per-triangle
+        # (no vertex sharing), so the refined mesh appears as many tiny disconnected
+        # components. Boundary-loop extraction on that mesh becomes meaningless and
+        # can falsely trigger auto_fill_blanks which then masks everything.
+        #
+        # For diagnostics and boundary envelopes, always use the *coarse* surface mesh.
+        tri_diag = tri_idx
+        UV_diag = UV
+        tri_mask_diag = None
+        if np.any(~np.isfinite(d_base)):
+            tri_mask_diag = np.any((~np.isfinite(d_base))[tri_idx], axis=1)
+        tri_for_diag = Triangulation(UV_diag[:, 0], UV_diag[:, 1], tri_diag)
+
         diag_result = _diagnose_blank_regions(
             requested_subdiv=int(refine_subdivisions or 0),
             applied_subdiv=applied_subdiv,
-            UV_plot=UV_plot,
-            tri_plot=tri_plot,
-            tri=tri,
+            UV_plot=UV_diag,
+            tri_plot=tri_diag,
+            tri=tri_for_diag,
             u_plot=u_plot,
             d_plot=d_plot,
-            tri_mask=tri_mask,
+            tri_mask=tri_mask_diag,
         )
 
         coverage_threshold = 0.80
         if auto_fill_blanks and diag_result.coverage_ratio_envelope < coverage_threshold:
             tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
-            boundary_mask = _mask_tris_with_loops(tri, UV_plot, diag_result.boundary_loops)
+            loops_coords = [
+                UV_diag[np.asarray(loop, dtype=np.int64)]
+                for loop in (diag_result.boundary_loops or [])
+            ]
+            boundary_mask = _mask_tris_with_loops(tri, loops_coords)
             if np.any(boundary_mask):
                 tri.set_mask(boundary_mask)
 

@@ -332,8 +332,15 @@ class GraphConvLayer(tf.keras.layers.Layer):
         mix = tf.concat([feat, agg, rel_feat], axis=-1)
         out = self.lin(mix)
         out = self.act(out)
-        if self.dropout > 0.0 and training:
-            out = tf.nn.dropout(out, rate=self.dropout)
+        if self.dropout > 0.0:
+            if training is None:
+                training = False
+            train_flag = tf.cast(training, tf.bool)
+            out = tf.cond(
+                train_flag,
+                lambda: tf.nn.dropout(out, rate=self.dropout),
+                lambda: out,
+            )
         return out
 
 
@@ -716,19 +723,31 @@ class DisplacementNet(tf.keras.Model):
 
         def graph_forward():
             coords = x
-            use_cached = (
-                self._global_knn_idx is not None
-                and self._global_knn_n is not None
-                and tf.shape(coords)[0] == self._global_knn_idx.shape[0]
-            )
-            if use_cached:
-                knn_idx = tf.cast(self._global_knn_idx, tf.int32)
-                adj = self._global_adj
+            n_nodes = tf.shape(coords)[0]
+
+            def _build_dynamic():
+                knn_dyn = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+                adj_dyn = _knn_to_adj(knn_dyn, n_nodes)
+                return tf.cast(knn_dyn, tf.int32), adj_dyn
+
+            if self._global_knn_idx is None:
+                knn_idx, adj = _build_dynamic()
             else:
-                knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
-                # Dynamic construct adj
-                adj = _knn_to_adj(knn_idx, tf.shape(coords)[0])
-                
+                if self._global_knn_n is not None:
+                    cached_n = tf.cast(self._global_knn_n, n_nodes.dtype)
+                else:
+                    cached_n = tf.cast(tf.shape(self._global_knn_idx)[0], n_nodes.dtype)
+
+                use_cached = tf.equal(n_nodes, cached_n)
+
+                def _use_cache():
+                    knn_cached = tf.cast(self._global_knn_idx, tf.int32)
+                    if self._global_adj is not None:
+                        return knn_cached, self._global_adj
+                    return knn_cached, _knn_to_adj(knn_cached, n_nodes)
+
+                knn_idx, adj = tf.cond(use_cached, _use_cache, _build_dynamic)
+                 
             hcur = self.graph_proj(h)
             film_gamma = self.film_gamma if self.use_film else None
             film_beta = self.film_beta if self.use_film else None

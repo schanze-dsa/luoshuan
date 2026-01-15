@@ -30,6 +30,7 @@ class BoltSurfaceSpec:
     name: str
     up_key: str
     down_key: Optional[str] = None
+    axis: Optional[Tuple[float, float, float]] = None  # optional bolt axis override (unit or non-unit)
 
 
 @dataclass
@@ -55,6 +56,7 @@ class BoltSampleData:
     w_dn: Optional[np.ndarray] = None
     dn_node_idx: Optional[np.ndarray] = None   # (n,3) int32
     dn_bary: Optional[np.ndarray] = None       # (n,3) float32
+    axis: Optional[np.ndarray] = None          # (3,) float32, unit axis for pretension
 
 
 def _compute_area_weights(tri_idx: np.ndarray, tri_areas: np.ndarray) -> np.ndarray:
@@ -95,6 +97,25 @@ def _map_node_ids_to_idx(sorted_node_ids: np.ndarray, node_ids: np.ndarray) -> n
         missing = np.unique(nid[bad])[:10]
         raise KeyError(f"Some node IDs are missing in asm.nodes (example: {missing}).")
     return idx.astype(np.int32)
+
+
+def _weighted_centroid(X: np.ndarray, w: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64).reshape(-1, 3)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    if X.size == 0 or w.size == 0:
+        return np.zeros((3,), dtype=np.float64)
+    wsum = float(np.sum(w)) + 1e-12
+    return (X * w[:, None]).sum(axis=0) / wsum
+
+
+def _normalize_axis(vec: np.ndarray) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float64).reshape(-1)
+    if v.size != 3:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return v / n
 
 
 # ---------- 辅助：把各种“表面样式”转为 (X,N,w) ----------
@@ -192,6 +213,17 @@ class PreloadWork:
                 if dn_bary is not None:
                     dn_bary = dn_bary[idy]
 
+            axis_vec = None
+            if getattr(sp, "axis", None) is not None:
+                axis_vec = _normalize_axis(np.asarray(sp.axis, dtype=np.float64))
+            elif X_dn is not None:
+                c_up = _weighted_centroid(X_up, w_up)
+                c_dn = _weighted_centroid(X_dn, w_dn)
+                axis_vec = _normalize_axis(c_up - c_dn)
+            else:
+                a_guess = _weighted_centroid(N_up, w_up)
+                axis_vec = _normalize_axis(a_guess)
+
             bolts.append(BoltSampleData(
                 name=sp.name,
                 X_up=X_up.astype(np.float32), N_up=N_up.astype(np.float32), w_up=w_up.astype(np.float32),
@@ -202,6 +234,7 @@ class PreloadWork:
                 w_dn=None if w_dn is None else w_dn.astype(np.float32),
                 dn_node_idx=None if dn_node_idx is None else dn_node_idx.astype(np.int32),
                 dn_bary=None if dn_bary is None else dn_bary.astype(np.float32),
+                axis=axis_vec.astype(np.float32) if axis_vec is not None else None,
             ))
         self._bolts = bolts
 
@@ -326,6 +359,29 @@ class PreloadWork:
             outs.append(tf.cast(Ui, tf.float32))
         return tf.concat(outs, axis=0)    # (N,3) float32
 
+    def _us_fn_chunked(self, us_fn, params, X, batch: int = None) -> tf.Tensor:
+        """
+        对大批量坐标 X 分块调用应力头 us_fn，返回 sigma。
+        - us_fn: 形如 us_fn(X, params) -> (u, sigma)
+        - 返回: (N,6) sigma（float32）
+        """
+        if batch is None:
+            batch = int(getattr(self.cfg, "forward_chunk", 2048))
+        batch = max(1, int(batch))
+
+        X = tf.convert_to_tensor(X)
+        if X.dtype != tf.float32:
+            X = tf.cast(X, tf.float32)
+
+        n = int(X.shape[0])
+        outs = []
+        for s in range(0, n, batch):
+            e = min(n, s + batch)
+            Xi = X[s:e]
+            _, si = us_fn(Xi, params)
+            outs.append(tf.cast(si, tf.float32))
+        return tf.concat(outs, axis=0)
+
     # --------- 物理量计算 ---------
     def _bolt_delta(
         self,
@@ -366,10 +422,14 @@ class PreloadWork:
             u_up = self._u_fn_chunked(
                 u_fn, params, X_up, batch=int(getattr(self.cfg, "forward_chunk", 2048))
             )  # (m,3)
-        # 轴向单位向量 a：用端面法向的面积加权平均近似
+        # 轴向单位向量 a：优先使用预计算轴向（更接近 ANSYS 的 pretension 轴）
         wsum_up = tf.reduce_sum(w_up) + eps
-        a = tf.reduce_sum(N_up * w_up[:, None], axis=0) / wsum_up
-        a = a / (tf.norm(a) + eps)  # (3,)
+        if bolt.axis is not None:
+            a = tf.cast(tf.convert_to_tensor(bolt.axis), dtype)
+            a = a / (tf.norm(a) + eps)
+        else:
+            a = tf.reduce_sum(N_up * w_up[:, None], axis=0) / wsum_up
+            a = a / (tf.norm(a) + eps)  # (3,)
 
         uax_up = tf.reduce_sum(u_up * a[None, :], axis=1)              # (m,)
         mean_up = tf.reduce_sum(uax_up * w_up) / wsum_up               # scalar
@@ -396,6 +456,50 @@ class PreloadWork:
         mean_dn = tf.reduce_sum(uax_dn * w_dn) / wsum_dn
 
         return tf.cast(mean_up - mean_dn, tf.float32)
+
+    def _bolt_axial_force(
+        self,
+        us_fn,
+        params,
+        bolt: BoltSampleData,
+        *,
+        use_down: bool = False,
+    ) -> tf.Tensor:
+        """
+        Approximate axial resultant force on a bolt end face:
+            F_b = ∫ (sigma · n) · a dA
+
+        Stress head ordering assumed: [xx, yy, zz, xy, yz, xz].
+        """
+        # Use up face by default; fall back to down face if requested/available.
+        if use_down and bolt.X_dn is not None:
+            X = tf.cast(tf.convert_to_tensor(bolt.X_dn), tf.float32)
+            N = tf.cast(tf.convert_to_tensor(bolt.N_dn), tf.float32)
+            w = tf.cast(tf.convert_to_tensor(bolt.w_dn), tf.float32)
+        else:
+            X = tf.cast(tf.convert_to_tensor(bolt.X_up), tf.float32)
+            N = tf.cast(tf.convert_to_tensor(bolt.N_up), tf.float32)
+            w = tf.cast(tf.convert_to_tensor(bolt.w_up), tf.float32)
+
+        sigma = self._us_fn_chunked(us_fn, params, X)  # (m,6)
+        sigma = sigma[:, :6]
+        sxx, syy, szz, sxy, syz, sxz = tf.unstack(sigma, axis=1)
+        nx, ny, nz = tf.unstack(N, axis=1)
+        # traction = sigma · n
+        tx = sxx * nx + sxy * ny + sxz * nz
+        ty = sxy * nx + syy * ny + syz * nz
+        tz = sxz * nx + syz * ny + szz * nz
+        t = tf.stack([tx, ty, tz], axis=1)
+
+        if bolt.axis is not None:
+            a = tf.cast(tf.convert_to_tensor(bolt.axis), tf.float32)
+        else:
+            wsum = tf.reduce_sum(w) + tf.cast(1e-12, tf.float32)
+            a = tf.reduce_sum(N * w[:, None], axis=0) / wsum
+        a = a / (tf.norm(a) + 1e-12)
+
+        f = tf.reduce_sum(w * tf.reduce_sum(t * a[None, :], axis=1))
+        return tf.cast(f, tf.float32)
 
     def energy(self, u_fn, params: Dict[str, tf.Tensor], *, u_nodes: Optional[tf.Tensor] = None):
         """
@@ -447,3 +551,49 @@ class PreloadWork:
         W_pre = tf.reduce_sum(P[:nb] * delta_vec) * tf.constant(self.cfg.work_coeff, dtype=tf.float32)
         stats = {"preload": {"bolt_deltas": delta_vec}}
         return W_pre, stats
+
+    def residual(
+        self,
+        u_fn,
+        params: Dict[str, tf.Tensor],
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        stress_fn=None,
+    ):
+        """
+        Residual-only preload term.
+
+        Prefer axial force residual (requires stress head):
+            r_pre,b = (F_b - P_b^target) / P_ref
+        Falls back to zero if stress_fn is not available.
+        """
+        if not self._bolts:
+            zero = tf.constant(0.0, dtype=tf.float32)
+            return zero, {"preload": {"bolt_deltas": tf.zeros((0,), tf.float32)}}
+
+        P = tf.convert_to_tensor(params.get("P", [0.0, 0.0, 0.0]), dtype=tf.float32)
+        nb = len(self._bolts)
+
+        # Always compute bolt_deltas for force-then-lock usage.
+        deltas = []
+        for bolt in self._bolts:
+            di = self._bolt_delta(u_fn, params, bolt, u_nodes=u_nodes)
+            deltas.append(di)
+        delta_vec = tf.stack(deltas, axis=0)
+        stats = {"preload": {"bolt_deltas": delta_vec}}
+
+        if stress_fn is None:
+            return tf.constant(0.0, dtype=tf.float32), stats
+
+        forces = []
+        for bolt in self._bolts:
+            fi = self._bolt_axial_force(stress_fn, params, bolt)
+            forces.append(fi)
+        force_vec = tf.stack(forces, axis=0)
+        stats["preload"]["bolt_forces"] = force_vec
+
+        P_ref = tf.maximum(tf.reduce_max(tf.abs(P[:nb])), tf.constant(1.0, dtype=tf.float32))
+        r_pre = (force_vec - tf.cast(P[:nb], tf.float32)) / P_ref
+        L_pre = tf.reduce_mean(r_pre * r_pre)
+        stats["preload"]["preload_rms"] = tf.sqrt(tf.reduce_mean(r_pre * r_pre) + 1e-12)
+        return L_pre, stats

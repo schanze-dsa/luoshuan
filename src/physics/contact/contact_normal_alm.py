@@ -78,6 +78,11 @@ def softplus_neg(x: tf.Tensor, beta: tf.Tensor) -> tf.Tensor:
     return tf.nn.softplus(-x * beta) / (beta + 1e-12)
 
 
+def fb_residual(a: tf.Tensor, b: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
+    """Fischer-Burmeister complementarity residual."""
+    return tf.sqrt(a * a + b * b + eps * eps) - a - b
+
+
 @dataclass
 class NormalALMConfig:
     """Hyperparameters for the normal-contact ALM operator."""
@@ -85,6 +90,8 @@ class NormalALMConfig:
     beta: float = 100.0         # softplus steepness (增大默认值以逼近硬接触)
     mu_n: float = 1.0e3         # ALM coefficient (normal penalty)
     enforce_nonneg_lambda: bool = True
+    residual_mode: str = "fb"   # "fb" | "proj" (residual-only formulation)
+    fb_eps: float = 1.0e-8      # smoothing for FB residual
     dtype: str = "float32"
 
 
@@ -377,6 +384,62 @@ class NormalContactALM:
         self.lmbda.assign(new_lmbda)
 
     # ------------------------------------------------------------------ #
+    # Residual-only term (no energy)
+    # ------------------------------------------------------------------ #
+
+    def residual(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        """
+        Residual-only normal-contact term.
+
+        - FB residual (default): r = sqrt(g^2 + λ^2 + eps^2) - g - λ
+        - Projection residual:  r = λ - proj(λ + κ(-g)),  proj(x)=max(0,x)
+        """
+        if self.xs is None or self.xm is None or self.n is None or self.w is None:
+            raise RuntimeError("[NormalContactALM] build_from_numpy/build_from_cat must be called first.")
+
+        g = self._gap(u_fn, params, u_nodes=u_nodes)
+        self._last_gap = g
+
+        if self.lmbda is None:
+            self.lmbda = tf.Variable(
+                tf.zeros((tf.shape(g)[0],), dtype=self.dtype),
+                trainable=False,
+                name="lambda_n",
+            )
+        lam = tf.cast(self.lmbda, self.dtype)
+
+        mode = str(getattr(self.cfg, "residual_mode", "fb") or "fb").strip().lower()
+        if mode in {"proj", "projection"}:
+            kappa = tf.cast(self.mu_n, self.dtype)
+            lam_proj = tf.maximum(tf.cast(0.0, self.dtype), lam + kappa * (-g))
+            r = lam - lam_proj
+        else:
+            eps = tf.cast(getattr(self.cfg, "fb_eps", 1.0e-8), self.dtype)
+            r = fb_residual(g, lam, eps)
+
+        r2 = r * r
+        w = tf.cast(self.w, self.dtype)
+        denom = tf.reduce_sum(w) + tf.cast(1e-12, self.dtype)
+        L_cn = tf.reduce_sum(w * r2) / denom
+
+        abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))
+        stats = {
+            "mode": tf.constant(mode, dtype=tf.string),
+            "cn_rms": tf.sqrt(tf.reduce_mean(abs_r * abs_r) + 1e-20),
+            "cn_max": tf.reduce_max(abs_r),
+            "cn_min_gap": tf.reduce_min(g),
+            "cn_mean_gap": tf.reduce_mean(g),
+            "cn_pen_ratio": tf.reduce_mean(tf.cast(g < 0.0, self.dtype)),
+        }
+        return L_cn, stats
+
+    # ------------------------------------------------------------------ #
     # Schedules / setters / misc
     # ------------------------------------------------------------------ #
 
@@ -428,6 +491,12 @@ class NormalContactALM:
         self._built_N = 0
         self._last_gap = None
         self._auto_flip_done = False
+
+    def reset_multipliers(self):
+        """Reset ALM multipliers for the current batch (keep geometry)."""
+        if self.lmbda is not None:
+            self.lmbda.assign(tf.zeros_like(self.lmbda))
+        self._last_gap = None
 
 
 # --------------------------------------------------------------------------- #

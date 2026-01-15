@@ -93,6 +93,7 @@ class FrictionALMConfig:
     k_t: float = 5.0e2          # tangential penalty "stiffness" (for trial traction)
     mu_t: float = 1.0e3         # ALM coefficient for tangential residual pseudo-energy
     eps: float = 1.0e-6         # smoothing for ||·||_eps
+    use_delta_st: bool = False  # use incremental tangential slip (delta) for friction update
 
     # 是否使用“有效法向压力” p_eff（建议 True）
     use_effective_normal: bool = True
@@ -100,6 +101,7 @@ class FrictionALMConfig:
     # 是否启用平滑摩擦能量路径（推荐训练用）
     use_smooth_friction: bool = False
     smooth_s0: float = 1.0e-3   # 光滑尺度 s0，量纲与 |s_t| 相同
+    smooth_blend: float = 1.0   # 0=严格(ALM), 1=平滑；(0,1) 线性混合
 
     dtype: str = "float32"
 
@@ -153,6 +155,7 @@ class FrictionContactALM:
 
         # cache
         self._last_st: Optional[tf.Tensor] = None
+        self._ref_st: Optional[tf.Tensor] = None
         self._last_tau_trial: Optional[tf.Tensor] = None
         self._last_tau: Optional[tf.Tensor] = None
         self._last_r_norm: Optional[tf.Tensor] = None
@@ -224,6 +227,7 @@ class FrictionContactALM:
 
         # clear caches
         self._last_st = None
+        self._ref_st = None
         self._last_tau_trial = None
         self._last_tau = None
         self._last_r_norm = None
@@ -238,6 +242,7 @@ class FrictionContactALM:
         return {
             "lmbda_t": tf.identity(self.lmbda_t),
             "_last_st": None if self._last_st is None else tf.identity(self._last_st),
+            "_ref_st": None if self._ref_st is None else tf.identity(self._ref_st),
         }
 
     def restore_state(self, state: Dict[str, tf.Tensor]):
@@ -254,10 +259,37 @@ class FrictionContactALM:
             self._last_st = None
         else:
             self._last_st = tf.cast(st, self.dtype)
+        ref = state.get("_ref_st", None)
+        if ref is None:
+            self._ref_st = None
+        else:
+            self._ref_st = tf.cast(ref, self.dtype)
 
     def last_slip(self) -> Optional[tf.Tensor]:
         """Return cached tangential slip (N,2) from the last energy call, if any."""
         return self._last_st
+
+    def capture_reference(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> Optional[tf.Tensor]:
+        """Capture current absolute tangential slip as the incremental reference."""
+        st = self._absolute_slip_t(u_fn, params, u_nodes=u_nodes)
+        self._ref_st = tf.identity(st) if st is not None else None
+        return st
+
+    def commit_reference(self):
+        """Commit the latest slip as the new incremental reference."""
+        if self._last_st is None:
+            return
+        self._ref_st = tf.identity(self._last_st)
+
+    def reset_reference(self):
+        """Clear incremental reference so the next step uses absolute slip."""
+        self._ref_st = None
 
     def build_from_cat(
         self,
@@ -279,12 +311,15 @@ class FrictionContactALM:
 
     # ---------- internals ----------
 
-    def _relative_slip_t(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
-        """
-        Compute tangential relative displacement components s_t in the [t1,t2] basis:
-            s  = ((xs + u(xs)) - (xm + u(xm)))
-            s_t = [ t1·s, t2·s ]  -> shape (N,2)
-        """
+    def _absolute_slip_t(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        update_cache: bool = True,
+    ) -> tf.Tensor:
+        """Compute absolute tangential slip components in the [t1,t2] basis."""
         xs = tf.cast(self.xs, self.dtype)
         xm = tf.cast(self.xm, self.dtype)
         t1 = tf.cast(self.t1, self.dtype)
@@ -310,7 +345,27 @@ class FrictionContactALM:
         s2 = tf.reduce_sum(t2 * s, axis=1)           # (N,)
         st = tf.stack([s1, s2], axis=1)              # (N,2)
 
-        self._last_st = st
+        if update_cache:
+            self._last_st = st
+        return st
+
+    def _relative_slip_t(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        update_cache: bool = True,
+    ) -> tf.Tensor:
+        """
+        Return tangential slip for friction update. If use_delta_st is enabled,
+        return incremental slip relative to the stored reference.
+        """
+        st = self._absolute_slip_t(u_fn, params, u_nodes=u_nodes, update_cache=update_cache)
+        if self.cfg.use_delta_st:
+            if self._ref_st is None:
+                return st
+            return st - self._ref_st
         return st
 
     def _effective_normal_pressure(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
@@ -376,77 +431,166 @@ class FrictionContactALM:
                 raise RuntimeError("use_effective_normal=False still needs link_normal(normal_op).")
             p_eff = tf.maximum(self.normal_op.lmbda, tf.cast(0.0, self.dtype))
 
+        blend = float(getattr(self.cfg, "smooth_blend", 1.0))
+        blend = max(0.0, min(1.0, blend))
+        use_smooth = bool(self.cfg.use_smooth_friction) and blend > 0.0
+        use_alm = (not self.cfg.use_smooth_friction) or blend < 1.0
+        blend_t = tf.cast(blend, self.dtype)
+
+        # 预分配
+        Et_smooth = None
+        Et_alm = None
+        r = None
+        r_norm = None
+        tau_trial = None
+        tau = None
+        stats_s: Dict[str, tf.Tensor] = {}
+        stats_a: Dict[str, tf.Tensor] = {}
+
         # 模式 1：平滑摩擦能量路径
-        if self.cfg.use_smooth_friction:
+        if use_smooth:
             # r = ||s_t||, 光滑伪势 psi
             r = tf.sqrt(tf.reduce_sum(st * st, axis=1) + tf.cast(1e-12, self.dtype))  # (N,)
             s0 = self.s0
             r_over_s0 = r / (s0 + tf.cast(1e-12, self.dtype))
             psi = (s0 * s0) * (tf.sqrt(1.0 + r_over_s0 * r_over_s0) - 1.0)           # (N,)
 
-            Et = tf.reduce_sum(w_eff * self.mu_f * p_eff * psi)
+            Et_smooth = tf.reduce_sum(w_eff * self.mu_f * p_eff * psi)
 
-            # 统计信息
-            stats = {
+            stats_s = {
                 "mode": tf.constant("smooth", dtype=tf.string),
                 "slip_mean": tf.reduce_mean(r),
                 "psi_mean": tf.reduce_mean(psi),
                 "p_eff_mean": tf.reduce_mean(p_eff),
             }
+            stats_s["R_fric_comp"] = tf.reduce_sum(w_eff * r)
 
-            # 为后续可能的 “R_fric_comp” 接口预留：这里用 w_eff * r 表示
-            stats["R_fric_comp"] = tf.reduce_sum(w_eff * r)
+        # 模式 2：经典 ALM 残差伪能量
+        if use_alm:
+            tau_trial = self.lmbda_t + self.k_t * st                # (N,2)
+            tau_c = self.mu_f * p_eff                               # (N,)
 
-            # 更新 cache（无 tau/tau_trial 概念，用 None）
+            eps = tf.cast(self.eps, self.dtype)
+            norm_trial = tf.sqrt(
+                tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps
+            )                                                        # (N,)
+            scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
+            tau = tau_trial * scale[:, None]                         # (N,2)
+
+            r_t = tau_trial - tau                                    # (N,2)
+            r_norm = tf.sqrt(tf.reduce_sum(r_t * r_t, axis=1) + 1e-12)
+
+            Et_alm = tf.reduce_sum(
+                w_eff * (0.5 / self.mu_t) * tf.reduce_sum(r_t * r_t, axis=1)
+            )
+
+            stick = tf.cast(scale >= 0.999, self.dtype)              # scale ~1 => stick
+            slip = tf.cast(scale < 0.999, self.dtype)
+
+            stats_a = {
+                "mode": tf.constant("alm_residual", dtype=tf.string),
+                "stick_ratio": tf.reduce_mean(stick),
+                "slip_ratio": tf.reduce_mean(slip),
+                "tau_trial_mean": tf.reduce_mean(norm_trial),
+                "tau_mean": tf.reduce_mean(tf.sqrt(tf.reduce_sum(tau * tau, axis=1))),
+                "R_fric_comp": tf.reduce_sum(w_eff * r_norm),
+            }
+
+        # 单一路径：平滑
+        if use_smooth and not use_alm:
             self._last_tau_trial = None
             self._last_tau = None
             self._last_r_norm = r
+            return Et_smooth, stats_s
 
-            return Et, stats
+        # 单一路径：ALM
+        if use_alm and not use_smooth:
+            self._last_tau_trial = tau_trial
+            self._last_tau = tau
+            self._last_r_norm = r_norm
+            return Et_alm, stats_a
 
-        # 模式 2：经典 ALM 残差伪能量
-        # trial traction
-        tau_trial = self.lmbda_t + self.k_t * st                # (N,2)
-
-        # friction cone radius
-        tau_c = self.mu_f * p_eff                               # (N,)
-
-        # smooth projection onto cone
-        eps = tf.cast(self.eps, self.dtype)
-        norm_trial = tf.sqrt(
-            tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps
-        )                                                        # (N,)
-        scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
-        tau = tau_trial * scale[:, None]                         # (N,2)
-
-        # residual & energy
-        r_t = tau_trial - tau                                    # (N,2)
-        r_norm = tf.sqrt(tf.reduce_sum(r_t * r_t, axis=1) + 1e-12)
-
-        Et = tf.reduce_sum(
-            w_eff * (0.5 / self.mu_t) * tf.reduce_sum(r_t * r_t, axis=1)
+        # 混合路径
+        Et = blend_t * tf.cast(Et_smooth, self.dtype) + (1.0 - blend_t) * tf.cast(Et_alm, self.dtype)
+        stats = {
+            "mode": tf.constant("blend", dtype=tf.string),
+            "smooth_blend": tf.cast(blend_t, self.dtype),
+            "slip_mean": stats_s.get("slip_mean", tf.reduce_mean(r)),
+            "psi_mean": stats_s.get("psi_mean", tf.reduce_mean(r)),
+            "tau_trial_mean": stats_a.get("tau_trial_mean", tf.reduce_mean(r_norm)),
+            "tau_mean": stats_a.get("tau_mean", tf.reduce_mean(r_norm)),
+            "p_eff_mean": stats_s.get("p_eff_mean", tf.reduce_mean(p_eff)),
+        }
+        stats["R_fric_comp"] = (
+            blend_t * tf.reduce_sum(w_eff * r)
+            + (1.0 - blend_t) * tf.reduce_sum(w_eff * r_norm)
         )
 
-        # 统计（粘/滑比例）
-        stick = tf.cast(scale >= 0.999, self.dtype)              # scale ~1 => inside cone => stick
-        slip = tf.cast(scale < 0.999, self.dtype)
+        self._last_tau_trial = tau_trial
+        self._last_tau = tau
+        self._last_r_norm = blend_t * r + (1.0 - blend_t) * r_norm
+        return Et, stats
 
+    # ---------- residual (no energy) ----------
+
+    def residual(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        """
+        Residual-only friction term using projection residual:
+            r_t = tau_trial - proj_{||tau||<=mu*p_eff}(tau_trial)
+        """
+        if self.xs is None or self.xm is None or self.t1 is None or self.t2 is None or self.w is None:
+            raise RuntimeError("[FrictionContactALM] build_from_numpy/build_from_cat must be called first.")
+        if self.lmbda_t is None:
+            self.lmbda_t = tf.Variable(
+                tf.zeros((tf.shape(self.xs)[0], 2), dtype=self.dtype),
+                trainable=False,
+                name="lambda_t",
+            )
+
+        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes, update_cache=True)  # (N,2)
+
+        if self.cfg.use_effective_normal:
+            p_eff = self._effective_normal_pressure(u_fn, params, u_nodes=u_nodes)
+        else:
+            if self.normal_op is None:
+                raise RuntimeError("use_effective_normal=False still needs link_normal(normal_op).")
+            p_eff = tf.maximum(self.normal_op.lmbda, tf.cast(0.0, self.dtype))
+
+        tau_trial = self.lmbda_t + self.k_t * st
+        tau_c = self.mu_f * p_eff
+
+        eps = tf.cast(self.eps, self.dtype)
+        norm_trial = tf.sqrt(tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps)
+        scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
+        tau = tau_trial * scale[:, None]
+        r_t = tau_trial - tau
+
+        r_norm = tf.sqrt(tf.reduce_sum(r_t * r_t, axis=1) + 1e-12)
+        w_eff = tf.cast(self.w, self.dtype)
+        denom = tf.reduce_sum(w_eff) + tf.cast(1e-12, self.dtype)
+        L_ct = tf.reduce_sum(w_eff * r_norm * r_norm) / denom
+
+        stick = tf.cast(scale >= 0.999, self.dtype)
+        slip = tf.cast(scale < 0.999, self.dtype)
         stats = {
-            "mode": tf.constant("alm_residual", dtype=tf.string),
+            "mode": tf.constant("residual", dtype=tf.string),
             "stick_ratio": tf.reduce_mean(stick),
             "slip_ratio": tf.reduce_mean(slip),
             "tau_trial_mean": tf.reduce_mean(norm_trial),
             "tau_mean": tf.reduce_mean(tf.sqrt(tf.reduce_sum(tau * tau, axis=1))),
-            # 为后续 TotalEnergy 等提供的残差度量
             "R_fric_comp": tf.reduce_sum(w_eff * r_norm),
         }
 
-        # cache
         self._last_tau_trial = tau_trial
         self._last_tau = tau
         self._last_r_norm = r_norm
-
-        return Et, stats
+        return L_ct, stats
 
     @tf.function(jit_compile=False)
     def update_multipliers(
@@ -464,7 +608,7 @@ class FrictionContactALM:
         其中 eta = step_scale 为可调步长因子。保持接口向后兼容。
         """
         # 切向滑移
-        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes)                  # (N,2)
+        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes, update_cache=False)  # (N,2)
 
         # 试探应力
         tau_trial = self.lmbda_t + self.k_t * st
@@ -507,6 +651,15 @@ class FrictionContactALM:
         """Update smoothness scale s0."""
         self.s0.assign(tf.cast(s0, self.dtype))
 
+    def set_smooth_blend(self, blend: float):
+        """Set smooth/strict blend weight in [0, 1]."""
+        try:
+            b = float(blend)
+        except Exception:
+            b = 0.0
+        b = max(0.0, min(1.0, b))
+        self.cfg.smooth_blend = b
+
     def multiply_weights(self, extra_w: np.ndarray):
         """Permanently multiply current per-sample weights by extra_w (Weighted PINN hooks)."""
         ew = _to_tf(extra_w, self.dtype)
@@ -520,5 +673,18 @@ class FrictionContactALM:
         self.lmbda_t = None
         self._built_N = 0
         self._last_st = None
+        self._ref_st = None
         self._last_tau_trial = None
         self._last_tau = None
+        self._last_r_norm = None
+
+    def reset_multipliers(self, reset_reference: bool = True):
+        """Reset ALM multipliers for the current batch (keep geometry)."""
+        if self.lmbda_t is not None:
+            self.lmbda_t.assign(tf.zeros_like(self.lmbda_t))
+        self._last_tau_trial = None
+        self._last_tau = None
+        self._last_r_norm = None
+        if reset_reference:
+            self._last_st = None
+            self._ref_st = None

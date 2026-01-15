@@ -28,7 +28,7 @@ Author: you
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -88,11 +88,21 @@ class MaterialLibrary:
     - This library does not enforce positivity checks on E, nu; do it in config validation if needed.
     """
 
-    def __init__(self, materials: Dict[str, Tuple[float, float]]):
+    def __init__(self, materials: Dict[str, Any]):
         """
         Args:
-            materials: dict {tag: (E, nu)}
+            materials: dict {tag: (E, nu)} or {tag: {"E": ..., "nu": ...}}
         """
+        def _extract_E_nu(spec: Any) -> Tuple[float, float]:
+            if isinstance(spec, (tuple, list)) and len(spec) >= 2:
+                return float(spec[0]), float(spec[1])
+            if isinstance(spec, dict):
+                return float(spec["E"]), float(spec["nu"])
+            raise TypeError(
+                "Material spec must be (E, nu) or a dict with keys 'E' and 'nu', "
+                f"got {type(spec)}"
+            )
+
         # Stable order
         tags = sorted(list(materials.keys()))
         self._specs: List[MaterialSpec] = []
@@ -100,7 +110,7 @@ class MaterialLibrary:
         C_list: List[np.ndarray] = []
 
         for i, tag in enumerate(tags):
-            E, nu = materials[tag]
+            E, nu = _extract_E_nu(materials[tag])
             self._specs.append(MaterialSpec(tag, float(E), float(nu)))
             self._tag2id[tag] = i
             C_list.append(isotropic_C_6x6(float(E), float(nu)))

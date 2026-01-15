@@ -198,6 +198,33 @@ class TiePenalty:
         }
         return E_tie, stats
 
+    def residual(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        """
+        Residual-only tie term (no energy semantics).
+        Returns mean weighted squared residual.
+        """
+        if self.xs is None or self.xm is None or self.w is None:
+            raise RuntimeError("[TiePenalty] build_from_numpy must be called first.")
+
+        u_s = u_fn(self.xs, params)
+        u_m = u_fn(self.xm, params)
+        if self.mask is None:
+            r = u_s - u_m
+        else:
+            r = (u_s - u_m) * self.mask
+
+        r2 = tf.reduce_sum(r * r, axis=1)
+        w = tf.cast(self.w, self.dtype)
+        denom = tf.reduce_sum(w) + tf.cast(1e-12, self.dtype)
+        L_tie = tf.reduce_sum(w * r2) / denom
+
+        abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))
+        stats = {
+            "tie_rms": tf.sqrt(tf.reduce_mean(abs_r * abs_r) + 1e-20),
+            "tie_max": tf.reduce_max(abs_r),
+        }
+        return L_tie, stats
+
     def update_multipliers(self, u_fn, params=None):
         """ALM外层更新：λ ← λ + μ·r，仅在mode='alm'时启用。"""
         if (self.cfg.mode or "penalty").lower() != "alm":

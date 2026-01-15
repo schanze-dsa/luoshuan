@@ -21,6 +21,8 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 # ============================================
 
 import sys
+import re
+import atexit
 import argparse
 import math
 from datetime import datetime
@@ -33,6 +35,69 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
+
+_LOG_READY = False
+_LOG_FILES = []
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class _Tee:
+    def __init__(self, *streams, filters=None):
+        self._streams = streams
+        if filters is None:
+            filters = [None] * len(streams)
+        if len(filters) < len(streams):
+            filters = list(filters) + [None] * (len(streams) - len(filters))
+        self._filters = filters
+
+    def write(self, data):
+        if not isinstance(data, str):
+            data = str(data)
+        for stream, filt in zip(self._streams, self._filters):
+            out = data if filt is None else filt(data)
+            if out:
+                stream.write(out)
+        for stream in self._streams:
+            stream.flush()
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._streams[0], name)
+
+
+def _strip_ansi(text: str) -> str:
+    text = _ANSI_RE.sub("", text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _setup_run_logs(log_dir: str = "", prefix: str = "train"):
+    """Duplicate stdout/stderr to files while keeping console output."""
+    global _LOG_READY, _LOG_FILES
+    if _LOG_READY:
+        return
+    base = log_dir or ROOT
+    os.makedirs(base, exist_ok=True)
+    stdout_path = os.path.join(base, f"{prefix}.log")
+    stderr_path = os.path.join(base, f"{prefix}.err")
+    stdout_f = open(stdout_path, "w", encoding="utf-8-sig", buffering=1)
+    stderr_f = open(stderr_path, "w", encoding="utf-8-sig", buffering=1)
+    _LOG_FILES = [stdout_f, stderr_f]
+    sys.stdout = _Tee(sys.stdout, stdout_f, filters=[None, _strip_ansi])
+    sys.stderr = _Tee(sys.stderr, stderr_f, filters=[None, _strip_ansi])
+    _LOG_READY = True
+
+    def _close_logs():
+        for handle in _LOG_FILES:
+            try:
+                handle.flush()
+                handle.close()
+            except Exception:
+                pass
+
+    atexit.register(_close_logs)
 
 # ---------- SavedModel 默认输出路径 ----------
 def _default_saved_model_dir(out_dir: str) -> str:
@@ -197,8 +262,15 @@ def _prepare_config_with_autoguess():
     train_steps = int(optimizer_cfg.get("epochs", TrainerConfig.max_steps))
     n_contact_points_per_pair = int(cfg_yaml.get("n_contact_points_per_pair", TrainerConfig.n_contact_points_per_pair))
     preload_face_points_each = int(cfg_yaml.get("preload_n_points_each", TrainerConfig.preload_n_points_each))
-    preload_range = cfg_yaml.get("preload_range_n", (TrainerConfig.preload_min, TrainerConfig.preload_max))
-    preload_min, preload_max = float(preload_range[0]), float(preload_range[1])
+    preload_min = cfg_yaml.get("preload_min", None)
+    preload_max = cfg_yaml.get("preload_max", None)
+    preload_range = cfg_yaml.get("preload_range_n", None)
+    if preload_min is None or preload_max is None:
+        if preload_range is None:
+            raise ValueError("config.yaml 必须显式提供 preload_min/preload_max 或 preload_range_n。")
+        preload_min, preload_max = float(preload_range[0]), float(preload_range[1])
+    else:
+        preload_min, preload_max = float(preload_min), float(preload_max)
 
     # 7) 组装训练配置
     cfg = TrainerConfig(
@@ -230,6 +302,16 @@ def _prepare_config_with_autoguess():
     if "save_path" in output_cfg:
         cfg.out_dir = str(output_cfg["save_path"])
 
+    # Mixed precision: default to fp32 unless explicitly enabled in config.yaml
+    if "mixed_precision" in cfg_yaml:
+        mp_cfg = cfg_yaml.get("mixed_precision", None)
+        if mp_cfg is None or mp_cfg is False:
+            cfg.mixed_precision = None
+        elif isinstance(mp_cfg, bool) and mp_cfg is True:
+            cfg.mixed_precision = "mixed_float16"
+        else:
+            cfg.mixed_precision = str(mp_cfg)
+
     cfg.viz_use_shape_function_interp = bool(
         output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
     )
@@ -259,6 +341,11 @@ def _prepare_config_with_autoguess():
 
     # ===== 预紧分阶段 / 顺序设置 =====
     staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+    stage_mode_top = cfg_yaml.get("preload_stage_mode", None)
+    if stage_mode_top is not None:
+        cfg.total_cfg.preload_stage_mode = str(stage_mode_top)
+    if "mode" in staging_cfg:
+        cfg.total_cfg.preload_stage_mode = str(staging_cfg["mode"])
 
     # 顶层布尔开关优先，其次是 staging_cfg 内的 enabled
     use_stages_val = cfg_yaml.get("preload_use_stages", None)
@@ -296,8 +383,29 @@ def _prepare_config_with_autoguess():
     if cfg.preload_sequence:
         cfg.preload_use_stages = True
 
+    # ===== Incremental Mode A (per-stage backprop) =====
+    if "incremental_mode" in cfg_yaml:
+        cfg.incremental_mode = bool(cfg_yaml.get("incremental_mode"))
+    if "stage_inner_steps" in cfg_yaml:
+        cfg.stage_inner_steps = int(cfg_yaml.get("stage_inner_steps", cfg.stage_inner_steps))
+    if "stage_alm_every" in cfg_yaml:
+        cfg.stage_alm_every = int(cfg_yaml.get("stage_alm_every", cfg.stage_alm_every))
+    if "stage_resample_contact" in cfg_yaml:
+        cfg.stage_resample_contact = bool(cfg_yaml.get("stage_resample_contact"))
+    if "reset_contact_state_per_case" in cfg_yaml:
+        cfg.reset_contact_state_per_case = bool(cfg_yaml.get("reset_contact_state_per_case"))
+    if "stage_schedule_steps" in cfg_yaml:
+        schedule = cfg_yaml.get("stage_schedule_steps") or []
+        if isinstance(schedule, (list, tuple)):
+            cfg.stage_schedule_steps = [int(x) for x in schedule]
+
     # ===== 损失加权配置（含自适应） =====
     loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
+    loss_mode = loss_cfg_yaml.get("mode", None)
+    if loss_mode is None:
+        loss_mode = loss_cfg_yaml.get("loss_mode", None)
+    if loss_mode is not None:
+        cfg.total_cfg.loss_mode = str(loss_mode)
     base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}
     weight_key_map = {
         "w_int": ("w_int", "E_int"),
@@ -307,6 +415,9 @@ def _prepare_config_with_autoguess():
         "w_bc": ("w_bc", "E_bc"),
         "w_pre": ("w_pre", "W_pre"),
         "w_sigma": ("w_sigma", "E_sigma"),
+        "w_eq": ("w_eq", "E_eq"),
+        "w_reg": ("w_reg", "E_reg"),
+        "w_lock": ("w_lock", "E_lock"),
         "w_path": ("path_penalty_weight", "path_penalty_total"),
         "w_fric_path": ("fric_path_penalty_weight", "fric_path_penalty_total"),
     }
@@ -332,6 +443,10 @@ def _prepare_config_with_autoguess():
             cfg.contact_cfg.normal.mu_n = float(normal_cfg_yaml["mu_n"])
         if "mode" in normal_cfg_yaml:
             cfg.contact_cfg.normal.mode = str(normal_cfg_yaml["mode"])
+        if "residual_mode" in normal_cfg_yaml:
+            cfg.contact_cfg.normal.residual_mode = str(normal_cfg_yaml["residual_mode"])
+        if "fb_eps" in normal_cfg_yaml:
+            cfg.contact_cfg.normal.fb_eps = float(normal_cfg_yaml["fb_eps"])
 
     fric_cfg_yaml = cfg_yaml.get("friction_config", {}) or {}
     if isinstance(fric_cfg_yaml, dict) and fric_cfg_yaml:
@@ -345,6 +460,16 @@ def _prepare_config_with_autoguess():
             val = bool(fric_cfg_yaml["use_smooth_friction"])
             cfg.contact_cfg.use_smooth_friction = val
             cfg.contact_cfg.friction.use_smooth_friction = val
+        if "use_delta_st_friction" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.use_delta_st = bool(fric_cfg_yaml["use_delta_st_friction"])
+        if "smooth_to_strict" in fric_cfg_yaml:
+            cfg.friction_smooth_schedule = bool(fric_cfg_yaml["smooth_to_strict"])
+        if "smooth_fraction" in fric_cfg_yaml:
+            cfg.friction_smooth_fraction = float(fric_cfg_yaml["smooth_fraction"])
+        if "smooth_steps" in fric_cfg_yaml:
+            cfg.friction_smooth_steps = int(fric_cfg_yaml["smooth_steps"])
+        if "blend_steps" in fric_cfg_yaml:
+            cfg.friction_blend_steps = int(fric_cfg_yaml["blend_steps"])
 
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
     cfg.loss_adaptive_enabled = bool(
@@ -395,21 +520,31 @@ def _prepare_config_with_autoguess():
     )
     cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
 
+    if cfg.incremental_mode:
+        cfg.contact_cfg.update_every_steps = 1
+        cfg.alm_update_every = 0
+
 
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
-    # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
-    cfg.model_cfg.encoder.width = 96
-    cfg.model_cfg.encoder.depth = 3
-    cfg.model_cfg.encoder.out_dim = 96
-    cfg.model_cfg.field.width = 320
-    cfg.model_cfg.field.depth = 9
-    cfg.model_cfg.field.residual_skips = (3, 6, 8)
+    debug_big_model = bool(cfg_yaml.get("debug_big_model", False))
+    if debug_big_model:
+        # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
+        cfg.model_cfg.encoder.width = 96
+        cfg.model_cfg.encoder.depth = 3
+        cfg.model_cfg.encoder.out_dim = 96
+        cfg.model_cfg.field.width = 320
+        cfg.model_cfg.field.depth = 9
+        cfg.model_cfg.field.residual_skips = (3, 6, 8)
 
     # 2) DFEM 采样配置（不再设置 Jacobian 相关字段）
     #    - chunk_size: 节点前向/能量评估的分块大小（防止一次性吃满显存）
     #    - n_points_per_step: 每一步参与 DFEM 积分的子单元/积分点个数上限
     cfg.elas_cfg.chunk_size = int(elas_cfg_yaml.get("chunk_size", 0))
-    cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
+    raw_n_points = elas_cfg_yaml.get("n_points_per_step", 4096)
+    if raw_n_points is None:
+        cfg.elas_cfg.n_points_per_step = None
+    else:
+        cfg.elas_cfg.n_points_per_step = int(raw_n_points)
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 
     # 3) 接触/预紧采样：根据阶段数做显存友好的调整
@@ -439,7 +574,7 @@ def _prepare_config_with_autoguess():
 
     # 分阶段加载时，ContactOperator 内部的 update_every_steps 会被每阶段多次调用，
     # 这里按阶段数放大一次频率，保持与单阶段训练相近的物理更新节奏。
-    if stage_multiplier > 1:
+    if stage_multiplier > 1 and not cfg.incremental_mode:
         try:
             cfg.contact_cfg.update_every_steps = int(
                 max(1, cfg.contact_cfg.update_every_steps * stage_multiplier)
@@ -495,18 +630,22 @@ def _prepare_config_with_autoguess():
         cfg.preload_n_points_each = per_stage_preload
 
         elas_target = cfg.elas_cfg.n_points_per_step
-        per_stage_elas = max(1024, math.ceil(elas_target / stage_multiplier))
-        per_stage_elas = max(1024, int(math.ceil(per_stage_elas * load_factor)))
-        if per_stage_elas != elas_target:
-            print(
-                "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
-                f"{elas_target} 调整为每阶段 {per_stage_elas}。"
-            )
-            cfg.elas_cfg.n_points_per_step = per_stage_elas
+        if elas_target is not None:
+            try:
+                if float(elas_target) <= 0:
+                    elas_target = None
+            except Exception:
+                pass
+        if elas_target is not None:
+            per_stage_elas = max(1024, math.ceil(float(elas_target) / stage_multiplier))
+            per_stage_elas = max(1024, int(math.ceil(per_stage_elas * load_factor)))
+            if per_stage_elas != elas_target:
+                print(
+                    "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
+                    f"{elas_target} 调整为每阶段 {per_stage_elas}。"
+                )
+                cfg.elas_cfg.n_points_per_step = per_stage_elas
 
-
-    # 4) 混合精度（4080S 支持）
-    cfg.mixed_precision = "mixed_float16"
 
     # 5) 根据预紧力范围自动调整归一化（映射到约 [-1, 1]）
     preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
@@ -550,6 +689,7 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
     print("\n[OK] 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
     print("   如需修改 INP 路径、表面名或超参，请编辑 config.yaml。")
 def main(argv=None):
+    _setup_run_logs()
     parser = argparse.ArgumentParser(
         description="Train the DFEM/PINN model."
     )

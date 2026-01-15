@@ -12,6 +12,7 @@ Composition (默认的线性组合形式，可以在外部被 loss_weights 覆�
         + w_tie * E_tie
         - w_pre * W_pre
         + w_sigma * E_sigma
+        + w_eq * E_eq
 
 Public usage (typical):
     # 1) Build sub-operators per batch
@@ -61,6 +62,7 @@ from physics.preload_model import PreloadWork, PreloadConfig
 @dataclass
 class TotalConfig:
     # coefficients for each term (基础权重；如用 loss_weights，可作为 base_weights)
+    loss_mode: str = "energy"  # "energy" | "residual"
     w_int: float = 1.0
     w_cn: float = 1.0            # normal contact  -> E_cn
     w_ct: float = 1.0            # frictional      -> E_ct
@@ -68,12 +70,20 @@ class TotalConfig:
     w_bc: float = 1.0            # boundary penalty -> E_bc
     w_pre: float = 1.0           # multiplies the subtracted W_pre
     w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
+    w_eq: float = 0.0            # equilibrium residual term (div σ_pred ≈ 0)
+    w_reg: float = 0.0           # regularization term (residual-only mode)
     # 参考应力尺度，用于将 E_sigma 归一化为无量纲（例如取材料屈服强度 MPa）
+    w_lock: float = 0.0          # staged preload: lock previously tightened bolts (force-then-lock)
     sigma_ref: float = 1.0
 
     # staged preload 路径惩罚权重（增量势能中对加载顺序敏感）
     path_penalty_weight: float = 1.0
     fric_path_penalty_weight: float = 1.0
+
+    # staged preload mode:
+    # - "cumulative_force": existing behaviour (forces remain applied cumulatively)
+    # - "force_then_lock": only current bolt is force-controlled; earlier bolts are locked
+    preload_stage_mode: str = "cumulative_force"
 
     adaptive_scheme: str = "contact_only"
 
@@ -132,6 +142,18 @@ class TotalEnergy:
             self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
         if not hasattr(self, "w_sigma"):
             self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
+        if not hasattr(self, "w_eq"):
+            self.w_eq = tf.Variable(self.cfg.w_eq, dtype=self.dtype, trainable=False, name="w_eq")
+        if not hasattr(self, "w_reg"):
+            self.w_reg = tf.Variable(self.cfg.w_reg, dtype=self.dtype, trainable=False, name="w_reg")
+        if not hasattr(self, "w_lock"):
+            self.w_lock = tf.Variable(self.cfg.w_lock, dtype=self.dtype, trainable=False, name="w_lock")
+
+    def _loss_mode(self) -> str:
+        mode = str(getattr(self.cfg, "loss_mode", "energy") or "energy").strip().lower()
+        if mode in {"residual", "residual_only", "res"}:
+            return "residual"
+        return "energy"
 
     # ---------- wiring ----------
 
@@ -196,6 +218,16 @@ class TotalEnergy:
         if not self._built:
             raise RuntimeError("[TotalEnergy] attach(...) must be called before energy().")
 
+        if self._loss_mode() == "residual":
+            if isinstance(params, dict) and params.get("stages"):
+                Pi, parts, stats = self._residual_staged(
+                    u_fn, params["stages"], params, tape, stress_fn=stress_fn
+                )
+            else:
+                parts, stats = self._compute_parts_residual(u_fn, params or {}, tape, stress_fn=stress_fn)
+                Pi = self._combine_parts(parts)
+            return Pi, parts, stats
+
         if isinstance(params, dict) and params.get("stages"):
             Pi, parts, stats = self._energy_staged(
                 u_fn, params["stages"], params, tape, stress_fn=stress_fn
@@ -215,7 +247,10 @@ class TotalEnergy:
             "E_cn": zero,
             "E_ct": zero,
             "E_tie": zero,
+            "E_bc": zero,
             "W_pre": zero,
+            "E_sigma": zero,
+            "E_eq": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
 
@@ -269,9 +304,13 @@ class TotalEnergy:
             parts["E_tie"] = tf.add_n(tie_terms)
 
         if self.bcs:
+            bc_terms = []
             for i, b in enumerate(self.bcs):
-                _, si = b.energy(u_fn, params)
+                E_bc_i, si = b.energy(u_fn, params)
+                bc_terms.append(tf.cast(E_bc_i, dtype))
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
+            if bc_terms:
+                parts["E_bc"] = tf.add_n(bc_terms)
 
         # Preload work (skip if w_pre=0)
         if self.preload is not None and abs(self.w_pre) > 1e-15:
@@ -283,26 +322,57 @@ class TotalEnergy:
             stats.update(pstats)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})
 
-        # 应力监督：需要应力头、弹性算子缓存以及配置中开启权重
-        if (
-            stress_fn is not None
-            and elastic_cache is not None
-            and getattr(self.elasticity.cfg, "stress_loss_weight", 0.0) > 0.0
-        ):
+        # 应力监督 / 平衡残差：需要应力头与弹性算子缓存
+        w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
+        w_eq = float(getattr(self.cfg, "w_eq", 0.0))
+        use_stress = stress_fn is not None and elastic_cache is not None
+        use_sigma = use_stress and w_sigma > 1e-15 and getattr(self.elasticity.cfg, "stress_loss_weight", 0.0) > 0.0
+        use_eq = use_stress and w_eq > 1e-15
+
+        if use_sigma or use_eq:
             eps_vec = tf.cast(elastic_cache["eps_vec"], dtype)
             lam = tf.cast(elastic_cache["lam"], dtype)
             mu = tf.cast(elastic_cache["mu"], dtype)
             dof_idx = tf.cast(elastic_cache["dof_idx"], tf.int32)
 
-            # 物理应力（Voigt）σ = λ tr(ε) I + 2 μ ε
-            tr_eps = eps_vec[:, 0] + eps_vec[:, 1] + eps_vec[:, 2]
-            eye_vec = tf.constant([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=dtype)
-            sigma_phys = lam[:, None] * tr_eps[:, None] * eye_vec + 2.0 * mu[:, None] * eps_vec
+            sigma_phys = elastic_cache.get("sigma_phys")
+            if sigma_phys is not None:
+                sigma_phys = tf.cast(sigma_phys, dtype)
+            else:
+                eps_tensor = elastic_cache.get("eps_tensor")
+                if eps_tensor is None:
+                    eps_tensor = tf.stack(
+                        [
+                            eps_vec[:, 0],
+                            eps_vec[:, 1],
+                            eps_vec[:, 2],
+                            0.5 * eps_vec[:, 3],
+                            0.5 * eps_vec[:, 4],
+                            0.5 * eps_vec[:, 5],
+                        ],
+                        axis=1,
+                    )
+                else:
+                    eps_tensor = tf.cast(eps_tensor, dtype)
+                tr_eps = eps_tensor[:, 0] + eps_tensor[:, 1] + eps_tensor[:, 2]
+                eye_vec = tf.constant([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=dtype)
+                sigma_phys = lam[:, None] * tr_eps[:, None] * eye_vec + 2.0 * mu[:, None] * eps_tensor
 
-            # 仅取最前面的 6 个分量进行监督
+            # ensure 6 components
             sigma_phys = sigma_phys[:, :6]
+            # align to stress head order: xx, yy, zz, xy, yz, xz
+            sigma_phys = tf.stack(
+                [
+                    sigma_phys[:, 0],
+                    sigma_phys[:, 1],
+                    sigma_phys[:, 2],
+                    sigma_phys[:, 5],
+                    sigma_phys[:, 3],
+                    sigma_phys[:, 4],
+                ],
+                axis=1,
+            )
 
-            # 将采样到的单元节点去重，评估应力头
             node_ids = tf.reshape(dof_idx // 3, (-1,))  # (M*4,)
             unique_nodes, rev = tf.unique(node_ids)
             X_nodes = tf.cast(tf.gather(self.elasticity.X_nodes_tf, unique_nodes), dtype)
@@ -314,43 +384,286 @@ class TotalEnergy:
             sigma_cells = tf.reshape(sigma_nodes_full, (tf.shape(dof_idx)[0], 4, -1))
             sigma_cells = tf.reduce_mean(sigma_cells, axis=1)
             sigma_cells = sigma_cells[:, : tf.shape(sigma_phys)[1]]
-
-            diff = sigma_cells - sigma_phys
             # 归一化：让应力监督项无量纲，避免其量纲/尺度压过势能项
             sigma_ref = tf.cast(getattr(self.cfg, "sigma_ref", 1.0), dtype)
             sigma_ref = tf.maximum(sigma_ref, tf.cast(1e-12, dtype))
-            diff_n = diff / sigma_ref
-            loss_sigma = tf.reduce_mean(diff_n * diff_n)
-            parts["E_sigma"] = loss_sigma * tf.cast(
-                getattr(self.elasticity.cfg, "stress_loss_weight", 1.0), dtype
-            )
-            stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_cells * sigma_cells) + 1e-20)
 
-            # Von Mises 应力（预测/物理），便于日志中评估与屈服强度的比值
-            def _von_mises(sig: tf.Tensor) -> tf.Tensor:
-                sxx, syy, szz, sxy, syz, sxz = tf.unstack(sig, axis=1)
-                return tf.sqrt(
-                    0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
-                    + 3.0 * (sxy * sxy + syz * syz + sxz * sxz)
+            if use_sigma:
+                diff = sigma_cells - sigma_phys
+                diff_n = diff / sigma_ref
+                loss_sigma = tf.reduce_mean(diff_n * diff_n)
+                parts["E_sigma"] = loss_sigma * tf.cast(
+                    getattr(self.elasticity.cfg, "stress_loss_weight", 1.0), dtype
                 )
+                stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_cells * sigma_cells) + 1e-20)
 
-            vm_pred = _von_mises(sigma_cells)
-            vm_phys = _von_mises(sigma_phys)
-            stats["stress_vm_pred_max"] = tf.reduce_max(vm_pred)
-            stats["stress_vm_pred_mean"] = tf.reduce_mean(vm_pred)
-            stats["stress_vm_phys_max"] = tf.reduce_max(vm_phys)
-            stats["stress_vm_phys_mean"] = tf.reduce_mean(vm_phys)
+                # Von Mises 应力（预测/物理），便于日志中评估与屈服强度的比值
+                def _von_mises(sig: tf.Tensor) -> tf.Tensor:
+                    sxx, syy, szz, sxy, syz, sxz = tf.unstack(sig, axis=1)
+                    return tf.sqrt(
+                        0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+                        + 3.0 * (sxy * sxy + syz * syz + sxz * sxz)
+                    )
+
+                vm_pred = _von_mises(sigma_cells)
+                vm_phys = _von_mises(sigma_phys)
+                stats["stress_vm_pred_max"] = tf.reduce_max(vm_pred)
+                stats["stress_vm_pred_mean"] = tf.reduce_mean(vm_pred)
+                stats["stress_vm_phys_max"] = tf.reduce_max(vm_phys)
+                stats["stress_vm_phys_mean"] = tf.reduce_mean(vm_phys)
+
+            if use_eq:
+                sample_idx = elastic_cache.get("sample_idx")
+                if sample_idx is not None:
+                    sample_idx = tf.cast(sample_idx, tf.int32)
+                    B_sel = tf.gather(self.elasticity.B_tf, sample_idx)
+                    w_sel = tf.gather(self.elasticity.w_tf, sample_idx)
+                else:
+                    B_sel = tf.cast(self.elasticity.B_tf, dtype)
+                    w_sel = tf.cast(self.elasticity.w_tf, dtype)
+
+                # reorder to match B's shear ordering: (xx,yy,zz,yz,xz,xy)
+                sigma_for_B = tf.stack(
+                    [
+                        sigma_cells[:, 0],
+                        sigma_cells[:, 1],
+                        sigma_cells[:, 2],
+                        sigma_cells[:, 4],
+                        sigma_cells[:, 5],
+                        sigma_cells[:, 3],
+                    ],
+                    axis=1,
+                )
+                sigma_for_B = sigma_for_B / sigma_ref
+
+                # element-wise internal force residual (weak form)
+                f_int = tf.einsum("mij,mi->mj", B_sel, sigma_for_B)
+                res = tf.reduce_sum(tf.square(f_int), axis=1)
+                if w_sel is not None:
+                    w_sel = tf.cast(w_sel, dtype)
+                    res = res * w_sel
+                    denom = tf.reduce_sum(w_sel) + tf.cast(1e-12, dtype)
+                else:
+                    denom = tf.cast(tf.shape(res)[0], dtype) + tf.cast(1e-12, dtype)
+                parts["E_eq"] = tf.reduce_sum(res) / denom
+                stats["eq_rms"] = tf.sqrt(tf.reduce_mean(res) + 1e-20)
+
+        return parts, stats
+
+    def _compute_parts_residual(self, u_fn, params, tape=None, stress_fn=None):
+        """Evaluate residual-only components for a given parameter dictionary."""
+        dtype = self.dtype
+        zero = tf.cast(0.0, dtype)
+        parts: Dict[str, tf.Tensor] = {
+            "E_int": zero,
+            "E_cn": zero,
+            "E_ct": zero,
+            "E_tie": zero,
+            "E_bc": zero,
+            "W_pre": zero,
+            "E_sigma": zero,
+            "E_eq": zero,
+            "E_lock": zero,
+            "E_reg": zero,
+        }
+        stats: Dict[str, tf.Tensor] = {}
+
+        u_nodes = None
+        elastic_cache = None
+        if self.elasticity is not None:
+            u_nodes = self.elasticity._eval_u_on_nodes(u_fn, params)
+            E_int_res = self.elasticity.energy(
+                u_fn,
+                params,
+                tape=tape,
+                return_cache=True,
+                u_nodes=u_nodes,
+            )
+            _, estates, elastic_cache = E_int_res  # type: ignore[misc]
+            stats.update({f"el_{k}": v for k, v in estates.items()})
+
+        if self.contact is not None:
+            _, cparts, stats_cn, stats_ct = self.contact.residual(u_fn, params, u_nodes=u_nodes)
+            if "E_cn" in cparts:
+                parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
+            elif "E_n" in cparts:
+                parts["E_cn"] = tf.cast(cparts["E_n"], dtype)
+            if "E_ct" in cparts:
+                parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
+            elif "E_t" in cparts:
+                parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
+            stats.update(stats_cn)
+            stats.update(stats_ct)
+            if "R_fric_comp" in stats_ct:
+                parts["R_fric_comp"] = tf.cast(stats_ct["R_fric_comp"], dtype)
+            if "R_contact_comp" in stats_cn:
+                parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
+
+        if self.ties and abs(self.w_tie) > 1e-15:
+            tie_terms = []
+            for tie in self.ties:
+                lt, tstat = tie.residual(u_fn, params)
+                tie_terms.append(tf.cast(lt, dtype))
+                if tstat:
+                    for k, v in tstat.items():
+                        stats[f"tie_{k}"] = v
+            parts["E_tie"] = tf.add_n(tie_terms)
+
+        if self.bcs:
+            bc_terms = []
+            for i, b in enumerate(self.bcs):
+                L_bc_i, si = b.residual(u_fn, params)
+                bc_terms.append(tf.cast(L_bc_i, dtype))
+                stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
+            if bc_terms:
+                parts["E_bc"] = tf.add_n(bc_terms)
+
+        if self.preload is not None and abs(self.w_pre) > 1e-15:
+            L_pre, pstats = self.preload.residual(
+                u_fn, params, u_nodes=u_nodes, stress_fn=stress_fn
+            )
+            parts["W_pre"] = tf.cast(L_pre, dtype)
+            stats.update(pstats)
+            stats.update({f"pre_{k}": v for k, v in pstats.items()})
+
+        w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
+        w_eq = float(getattr(self.cfg, "w_eq", 0.0))
+        w_reg = float(getattr(self.cfg, "w_reg", 0.0))
+        use_stress = stress_fn is not None and elastic_cache is not None
+        use_sigma = use_stress and w_sigma > 1e-15 and getattr(self.elasticity.cfg, "stress_loss_weight", 0.0) > 0.0
+        use_eq = elastic_cache is not None and w_eq > 1e-15
+        use_reg = elastic_cache is not None and w_reg > 1e-15
+
+        if use_sigma or use_eq or use_reg:
+            eps_vec = tf.cast(elastic_cache["eps_vec"], dtype)
+            lam = tf.cast(elastic_cache["lam"], dtype)
+            mu = tf.cast(elastic_cache["mu"], dtype)
+            dof_idx = tf.cast(elastic_cache["dof_idx"], tf.int32)
+
+            sigma_phys_raw = elastic_cache.get("sigma_phys")
+            if sigma_phys_raw is not None:
+                sigma_phys_raw = tf.cast(sigma_phys_raw, dtype)
+            else:
+                eps_tensor = elastic_cache.get("eps_tensor")
+                if eps_tensor is None:
+                    eps_tensor = tf.stack(
+                        [
+                            eps_vec[:, 0],
+                            eps_vec[:, 1],
+                            eps_vec[:, 2],
+                            0.5 * eps_vec[:, 3],
+                            0.5 * eps_vec[:, 4],
+                            0.5 * eps_vec[:, 5],
+                        ],
+                        axis=1,
+                    )
+                else:
+                    eps_tensor = tf.cast(eps_tensor, dtype)
+                tr_eps = eps_tensor[:, 0] + eps_tensor[:, 1] + eps_tensor[:, 2]
+                eye_vec = tf.constant([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=dtype)
+                sigma_phys_raw = lam[:, None] * tr_eps[:, None] * eye_vec + 2.0 * mu[:, None] * eps_tensor
+
+            sigma_phys_raw = sigma_phys_raw[:, :6]
+            sigma_phys_head = tf.stack(
+                [
+                    sigma_phys_raw[:, 0],
+                    sigma_phys_raw[:, 1],
+                    sigma_phys_raw[:, 2],
+                    sigma_phys_raw[:, 5],
+                    sigma_phys_raw[:, 3],
+                    sigma_phys_raw[:, 4],
+                ],
+                axis=1,
+            )
+
+            sigma_cells = None
+            if use_stress:
+                node_ids = tf.reshape(dof_idx // 3, (-1,))
+                unique_nodes, rev = tf.unique(node_ids)
+                X_nodes = tf.cast(tf.gather(self.elasticity.X_nodes_tf, unique_nodes), dtype)
+                _, sigma_pred_nodes = stress_fn(X_nodes, params)
+                sigma_pred_nodes = tf.cast(sigma_pred_nodes, dtype)
+
+                sigma_nodes_full = tf.gather(sigma_pred_nodes, rev)
+                sigma_cells = tf.reshape(sigma_nodes_full, (tf.shape(dof_idx)[0], 4, -1))
+                sigma_cells = tf.reduce_mean(sigma_cells, axis=1)
+                sigma_cells = sigma_cells[:, : tf.shape(sigma_phys_head)[1]]
+
+            sigma_ref = tf.cast(getattr(self.cfg, "sigma_ref", 1.0), dtype)
+            sigma_ref = tf.maximum(sigma_ref, tf.cast(1e-12, dtype))
+
+            if use_sigma and sigma_cells is not None:
+                diff = sigma_cells - sigma_phys_head
+                diff_n = diff / sigma_ref
+                loss_sigma = tf.reduce_mean(diff_n * diff_n)
+                parts["E_sigma"] = loss_sigma * tf.cast(
+                    getattr(self.elasticity.cfg, "stress_loss_weight", 1.0), dtype
+                )
+                stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_cells * sigma_cells) + 1e-20)
+
+            if use_eq:
+                sample_idx = elastic_cache.get("sample_idx")
+                if sample_idx is not None:
+                    sample_idx = tf.cast(sample_idx, tf.int32)
+                    B_sel = tf.gather(self.elasticity.B_tf, sample_idx)
+                    w_sel = tf.gather(self.elasticity.w_tf, sample_idx)
+                else:
+                    B_sel = tf.cast(self.elasticity.B_tf, dtype)
+                    w_sel = tf.cast(self.elasticity.w_tf, dtype)
+
+                if sigma_cells is not None:
+                    sigma_for_B = tf.stack(
+                        [
+                            sigma_cells[:, 0],
+                            sigma_cells[:, 1],
+                            sigma_cells[:, 2],
+                            sigma_cells[:, 4],
+                            sigma_cells[:, 5],
+                            sigma_cells[:, 3],
+                        ],
+                        axis=1,
+                    )
+                else:
+                    sigma_for_B = tf.cast(sigma_phys_raw, dtype)
+
+                sigma_for_B = sigma_for_B / sigma_ref
+                f_int = tf.einsum("mij,mi->mj", B_sel, sigma_for_B)
+                res = tf.reduce_sum(tf.square(f_int), axis=1)
+                if w_sel is not None:
+                    w_sel = tf.cast(w_sel, dtype)
+                    res = res * w_sel
+                    denom = tf.reduce_sum(w_sel) + tf.cast(1e-12, dtype)
+                else:
+                    denom = tf.cast(tf.shape(res)[0], dtype) + tf.cast(1e-12, dtype)
+                parts["E_eq"] = tf.reduce_sum(res) / denom
+                stats["eq_rms"] = tf.sqrt(tf.reduce_mean(res) + 1e-20)
+
+            if use_reg:
+                w_sel = elastic_cache.get("w_sel")
+                res = tf.reduce_sum(eps_vec * eps_vec, axis=1)
+                if w_sel is not None:
+                    w_sel = tf.cast(w_sel, dtype)
+                    res = res * w_sel
+                    denom = tf.reduce_sum(w_sel) + tf.cast(1e-12, dtype)
+                else:
+                    denom = tf.cast(tf.shape(res)[0], dtype) + tf.cast(1e-12, dtype)
+                parts["E_reg"] = tf.reduce_sum(res) / denom
 
         return parts, stats
 
     def _combine_parts(self, parts: Dict[str, tf.Tensor]) -> tf.Tensor:
+        pre_sign = tf.cast(-1.0 if self._loss_mode() == "energy" else 1.0, self.dtype)
         return (
             self.w_int * parts.get("E_int", tf.cast(0.0, self.dtype))
             + self.w_cn * parts.get("E_cn", tf.cast(0.0, self.dtype))
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
-            - self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
+            + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
+            + pre_sign * self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
+            + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
+            + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
+            + self.w_lock * parts.get("E_lock", tf.cast(0.0, self.dtype))
         )
 
     def _combine_parts_without_preload(self, parts: Dict[str, tf.Tensor]) -> tf.Tensor:
@@ -363,6 +676,9 @@ class TotalEnergy:
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
             + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
+            + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
+            + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
+            + self.w_lock * parts.get("E_lock", tf.cast(0.0, self.dtype))
         )
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
@@ -374,11 +690,16 @@ class TotalEnergy:
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma", "E_eq", "E_lock"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
-        path_penalty = tf.cast(0.0, dtype)
+        path_penalty_total = tf.cast(0.0, dtype)
+        fric_path_penalty_total = tf.cast(0.0, dtype)
         Pi_accum = tf.cast(0.0, dtype)
+
+        stage_mode = str(getattr(self.cfg, "preload_stage_mode", "cumulative_force") or "cumulative_force")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        force_then_lock = stage_mode == "force_then_lock"
 
         if isinstance(stages, dict):
             stage_tensor_P = stages.get("P")
@@ -430,6 +751,7 @@ class TotalEnergy:
         prev_slip: Optional[tf.Tensor] = None
         prev_W_pre = tf.cast(0.0, dtype)
         last_preload_entry: Optional[dict] = None
+        locked_deltas: Optional[tf.Tensor] = None
 
         stage_count = len(stage_seq)
 
@@ -443,18 +765,21 @@ class TotalEnergy:
             stage_params.setdefault("stage_index", stage_idx)
             stage_params.setdefault("stage_fraction", stage_frac)
 
+            # "force_then_lock": only the currently tightened bolt is force-controlled.
+            # Keep the cumulative target vector for path penalties/diagnostics.
+            if force_then_lock:
+                stage_last = stage_params.get("stage_last")
+                if stage_last is not None and "P" in stage_params:
+                    P_cumulative = tf.convert_to_tensor(stage_params["P"], dtype=tf.float32)
+                    stage_params["P_cumulative"] = P_cumulative
+                    stage_params["P"] = P_cumulative * tf.cast(stage_last, P_cumulative.dtype)
+
             stage_parts, stage_stats = self._compute_parts(
                 u_fn, stage_params, tape, stress_fn=stress_fn
             )
+            stage_parts = dict(stage_parts)
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
-
-            for key in keys:
-                cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
-                totals[key] = totals[key] + cur  # 原始累加，便于观察能量水平
-
-                stats_all[f"s{idx+1}_{key}"] = cur
-                stats_all[f"s{idx+1}_cum{key}"] = totals[key]
 
             bolt_deltas = None
             pre_entry = stage_stats.get("preload")
@@ -470,7 +795,50 @@ class TotalEnergy:
                     bolt_deltas = tf.cast(bd, dtype)
                     last_preload_entry = pre_entry
 
-            P_vec = tf.cast(tf.convert_to_tensor(stage_params.get("P", [])), dtype)
+            # Force-then-lock: lock the axial deltas of previously tightened bolts.
+            if force_then_lock and bolt_deltas is not None:
+                stage_mask = stage_params.get("stage_mask")
+                stage_last = stage_params.get("stage_last")
+                if stage_mask is not None and stage_last is not None:
+                    if locked_deltas is None:
+                        locked_deltas = tf.zeros_like(tf.cast(bolt_deltas, dtype))
+                    lock_mask = tf.clip_by_value(
+                        tf.cast(stage_mask, dtype) - tf.cast(stage_last, dtype),
+                        0.0,
+                        1.0,
+                    )
+                    res = (tf.cast(bolt_deltas, dtype) - locked_deltas) * lock_mask
+                    stage_parts["E_lock"] = tf.reduce_sum(res * res)
+                    last_vec = tf.cast(stage_last, dtype)
+                    locked_deltas = (
+                        last_vec * tf.stop_gradient(tf.cast(bolt_deltas, dtype))
+                        + (1.0 - last_vec) * locked_deltas
+                    )
+            stage_parts.setdefault("E_lock", tf.cast(0.0, dtype))
+
+            W_stage = tf.cast(stage_parts.get("W_pre", tf.cast(0.0, dtype)), dtype)
+            if force_then_lock and "P_cumulative" in stage_params:
+                stats_all[f"s{idx+1}_W_pre_stage"] = W_stage
+
+            for key in keys:
+                if key == "W_pre" and force_then_lock and "P_cumulative" in stage_params:
+                    cur = prev_W_pre + W_stage
+                else:
+                    cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
+                # staged objective uses ΔW_pre, so for adaptive combine_loss we expose the final W_pre;
+                # other energy parts remain stage-summed to match Π_step accumulation.
+                if key == "W_pre":
+                    totals[key] = cur
+                else:
+                    totals[key] = totals[key] + cur  # 原始累加，便于观察能量水平
+
+                stats_all[f"s{idx+1}_{key}"] = cur
+                stats_all[f"s{idx+1}_cum{key}"] = totals[key]
+
+            P_vec = tf.cast(
+                tf.convert_to_tensor(stage_params.get("P_cumulative", stage_params.get("P", []))),
+                dtype,
+            )
             slip_t = None
             if self.contact is not None and hasattr(self.contact, "last_friction_slip"):
                 slip_t = self.contact.last_friction_slip()
@@ -479,24 +847,29 @@ class TotalEnergy:
             w_fric_path = tf.cast(getattr(self.cfg, "fric_path_penalty_weight", 1.0), dtype)
 
             stage_path_penalty = tf.cast(0.0, dtype)
+            stage_path = tf.cast(0.0, dtype)
+            stage_fric_path = tf.cast(0.0, dtype)
             if idx > 0:
                 load_jump = tf.reduce_sum(tf.abs(P_vec - prev_P)) if prev_P is not None else tf.cast(0.0, dtype)
 
                 if bolt_deltas is not None and prev_bolt_deltas is not None:
                     disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
                     stage_path = disp_jump * load_jump
-                    stage_path_penalty = stage_path_penalty + w_path * stage_path
+                    path_penalty_total = path_penalty_total + stage_path
                     stats_all[f"s{idx+1}_path_penalty"] = stage_path
                     stats_all[f"s{idx+1}_path_penalty_w"] = w_path
 
                 if slip_t is not None and prev_slip is not None:
                     slip_jump = tf.reduce_sum(tf.abs(slip_t - prev_slip))
-                    fric_path = slip_jump * load_jump
-                    stage_path_penalty = stage_path_penalty + w_fric_path * fric_path
-                    stats_all[f"s{idx+1}_fric_path_penalty"] = fric_path
+                    stage_fric_path = slip_jump * load_jump
+                    fric_path_penalty_total = fric_path_penalty_total + stage_fric_path
+                    stats_all[f"s{idx+1}_fric_path_penalty"] = stage_fric_path
                     stats_all[f"s{idx+1}_fric_path_penalty_w"] = w_fric_path
+            stage_path_penalty = stage_path_penalty + w_path * stage_path + w_fric_path * stage_fric_path
 
             W_cur = tf.cast(stage_parts.get("W_pre", tf.cast(0.0, dtype)), dtype)
+            if force_then_lock and "P_cumulative" in stage_params:
+                W_cur = prev_W_pre + W_stage
             delta_W = W_cur - prev_W_pre
             stage_mech = self._combine_parts_without_preload(stage_parts)
 
@@ -506,7 +879,6 @@ class TotalEnergy:
             stats_all[f"s{idx+1}_Pi_mech"] = stage_mech
 
             Pi_accum = Pi_accum + stage_pi_step
-            path_penalty = path_penalty + stage_path_penalty
 
             if bolt_deltas is not None:
                 prev_bolt_deltas = bolt_deltas
@@ -538,7 +910,201 @@ class TotalEnergy:
             if "stage_count" in root_params:
                 stats_all["stage_count"] = root_params["stage_count"]
 
-        stats_all["path_penalty_total"] = path_penalty
+        stats_all["path_penalty_total"] = path_penalty_total
+        stats_all["fric_path_penalty_total"] = fric_path_penalty_total
+        totals["path_penalty_total"] = path_penalty_total
+        totals["fric_path_penalty_total"] = fric_path_penalty_total
+        if isinstance(last_preload_entry, dict):
+            stats_all["preload"] = last_preload_entry
+
+        Pi = Pi_accum
+        return Pi, totals, stats_all
+
+    def _residual_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
+        """Accumulate residual-only loss across staged preload applications."""
+        dtype = self.dtype
+        keys = [
+            "E_int",
+            "E_cn",
+            "E_ct",
+            "E_tie",
+            "E_bc",
+            "W_pre",
+            "E_sigma",
+            "E_eq",
+            "E_lock",
+            "E_reg",
+        ]
+        totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
+        stats_all: Dict[str, tf.Tensor] = {}
+        path_penalty_total = tf.cast(0.0, dtype)
+        fric_path_penalty_total = tf.cast(0.0, dtype)
+        Pi_accum = tf.cast(0.0, dtype)
+
+        stage_mode = str(getattr(self.cfg, "preload_stage_mode", "cumulative_force") or "cumulative_force")
+        stage_mode = stage_mode.strip().lower().replace("-", "_")
+        force_then_lock = stage_mode == "force_then_lock"
+
+        if isinstance(stages, dict):
+            stage_tensor_P = stages.get("P")
+            stage_tensor_feat = stages.get("P_hat")
+            stage_tensor_rank = stages.get("stage_rank")
+            stage_tensor_mask = stages.get("stage_mask")
+            stage_tensor_last = stages.get("stage_last")
+            if stage_tensor_P is None or stage_tensor_feat is None:
+                stage_seq: List[Dict[str, tf.Tensor]] = []
+            else:
+                stacked_rank = None
+                if stage_tensor_rank is not None:
+                    stacked_rank = tf.convert_to_tensor(stage_tensor_rank)
+                stacked_mask = None
+                if stage_tensor_mask is not None:
+                    stacked_mask = tf.convert_to_tensor(stage_tensor_mask)
+                stacked_last = None
+                if stage_tensor_last is not None:
+                    stacked_last = tf.convert_to_tensor(stage_tensor_last)
+                stage_seq = []
+                for idx, (p, z) in enumerate(
+                    zip(tf.unstack(stage_tensor_P, axis=0), tf.unstack(stage_tensor_feat, axis=0))
+                ):
+                    entry = {"P": p, "P_hat": z}
+                    if stacked_rank is not None:
+                        if stacked_rank.shape.rank == 2:
+                            entry["stage_rank"] = stacked_rank[idx]
+                        else:
+                            entry["stage_rank"] = stacked_rank
+                    if stacked_mask is not None:
+                        entry["stage_mask"] = stacked_mask[idx]
+                    if stacked_last is not None:
+                        entry["stage_last"] = stacked_last[idx]
+                    stage_seq.append(entry)
+        else:
+            stage_seq = []
+            for item in stages:
+                if isinstance(item, dict):
+                    stage_seq.append(item)
+                else:
+                    p_val, z_val = item
+                    stage_seq.append({"P": p_val, "P_hat": z_val})
+
+        if not stage_seq:
+            return self._combine_parts(totals), totals, stats_all
+
+        prev_bolt_deltas: Optional[tf.Tensor] = None
+        prev_P: Optional[tf.Tensor] = None
+        prev_slip: Optional[tf.Tensor] = None
+        last_preload_entry: Optional[dict] = None
+        locked_deltas: Optional[tf.Tensor] = None
+
+        stage_count = len(stage_seq)
+
+        for idx, stage_params in enumerate(stage_seq):
+            stage_idx = tf.cast(idx, tf.int32)
+            stage_frac = tf.cast(
+                0.0 if stage_count <= 1 else idx / max(stage_count - 1, 1), dtype
+            )
+            stage_params = dict(stage_params)
+            stage_params.setdefault("stage_index", stage_idx)
+            stage_params.setdefault("stage_fraction", stage_frac)
+
+            if force_then_lock:
+                stage_last = stage_params.get("stage_last")
+                if stage_last is not None and "P" in stage_params:
+                    P_cumulative = tf.convert_to_tensor(stage_params["P"], dtype=tf.float32)
+                    stage_params["P_cumulative"] = P_cumulative
+                    stage_params["P"] = P_cumulative * tf.cast(stage_last, P_cumulative.dtype)
+
+            stage_parts, stage_stats = self._compute_parts_residual(
+                u_fn, stage_params, tape, stress_fn=stress_fn
+            )
+            stage_parts = dict(stage_parts)
+            for k, v in stage_stats.items():
+                stats_all[f"s{idx+1}_{k}"] = v
+
+            bolt_deltas = None
+            pre_entry = stage_stats.get("preload")
+            if pre_entry is None:
+                pre_entry = stage_stats.get("preload_stats")
+            if pre_entry is None:
+                pre_entry = stage_stats.get("pre_preload")
+            if isinstance(pre_entry, dict):
+                bd = pre_entry.get("bolt_deltas")
+                if bd is None:
+                    bd = pre_entry.get("bolt_delta")
+                if bd is not None:
+                    bolt_deltas = tf.cast(bd, dtype)
+                    last_preload_entry = pre_entry
+
+            if force_then_lock and bolt_deltas is not None:
+                stage_mask = stage_params.get("stage_mask")
+                stage_last = stage_params.get("stage_last")
+                if stage_mask is not None and stage_last is not None:
+                    if locked_deltas is None:
+                        locked_deltas = tf.zeros_like(tf.cast(bolt_deltas, dtype))
+                    lock_mask = tf.clip_by_value(
+                        tf.cast(stage_mask, dtype) - tf.cast(stage_last, dtype),
+                        0.0,
+                        1.0,
+                    )
+                    res = (tf.cast(bolt_deltas, dtype) - locked_deltas) * lock_mask
+                    stage_parts["E_lock"] = tf.reduce_sum(res * res)
+                    last_vec = tf.cast(stage_last, dtype)
+                    locked_deltas = (
+                        last_vec * tf.stop_gradient(tf.cast(bolt_deltas, dtype))
+                        + (1.0 - last_vec) * locked_deltas
+                    )
+            stage_parts.setdefault("E_lock", tf.cast(0.0, dtype))
+
+            for key in keys:
+                cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
+                totals[key] = totals[key] + cur
+                stats_all[f"s{idx+1}_{key}"] = cur
+                stats_all[f"s{idx+1}_cum{key}"] = totals[key]
+
+            P_vec = tf.cast(
+                tf.convert_to_tensor(stage_params.get("P_cumulative", stage_params.get("P", []))),
+                dtype,
+            )
+            slip_t = None
+            if self.contact is not None and hasattr(self.contact, "last_friction_slip"):
+                slip_t = self.contact.last_friction_slip()
+
+            w_path = tf.cast(getattr(self.cfg, "path_penalty_weight", 1.0), dtype)
+            w_fric_path = tf.cast(getattr(self.cfg, "fric_path_penalty_weight", 1.0), dtype)
+
+            stage_path = tf.cast(0.0, dtype)
+            stage_fric_path = tf.cast(0.0, dtype)
+            if idx > 0:
+                load_jump = tf.reduce_sum(tf.abs(P_vec - prev_P)) if prev_P is not None else tf.cast(0.0, dtype)
+                if bolt_deltas is not None and prev_bolt_deltas is not None:
+                    disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
+                    stage_path = disp_jump * load_jump
+                    path_penalty_total = path_penalty_total + stage_path
+                    stats_all[f"s{idx+1}_path_penalty"] = stage_path
+                    stats_all[f"s{idx+1}_path_penalty_w"] = w_path
+                if slip_t is not None and prev_slip is not None:
+                    slip_jump = tf.reduce_sum(tf.abs(slip_t - prev_slip))
+                    stage_fric_path = slip_jump * load_jump
+                    fric_path_penalty_total = fric_path_penalty_total + stage_fric_path
+                    stats_all[f"s{idx+1}_fric_path_penalty"] = stage_fric_path
+                    stats_all[f"s{idx+1}_fric_path_penalty_w"] = w_fric_path
+
+            stage_path_penalty = w_path * stage_path + w_fric_path * stage_fric_path
+            stage_pi_step = self._combine_parts(stage_parts) + stage_path_penalty
+            stats_all[f"s{idx+1}_Pi_step"] = stage_pi_step
+
+            Pi_accum = Pi_accum + stage_pi_step
+
+            if bolt_deltas is not None:
+                prev_bolt_deltas = bolt_deltas
+            prev_P = P_vec
+            if slip_t is not None:
+                prev_slip = slip_t
+
+        stats_all["path_penalty_total"] = path_penalty_total
+        stats_all["fric_path_penalty_total"] = fric_path_penalty_total
+        totals["path_penalty_total"] = path_penalty_total
+        totals["fric_path_penalty_total"] = fric_path_penalty_total
         if isinstance(last_preload_entry, dict):
             stats_all["preload"] = last_preload_entry
 
