@@ -372,6 +372,14 @@ def _prepare_config_with_autoguess():
         cfg.preload_cfg.rank_relaxation = float(relax_top)
     if "relaxation" in staging_cfg:
         cfg.preload_cfg.rank_relaxation = float(staging_cfg["relaxation"])
+    if "preload_warn_on_missing_stress" in cfg_yaml:
+        cfg.preload_cfg.warn_on_missing_stress = bool(
+            cfg_yaml.get("preload_warn_on_missing_stress")
+        )
+    if "preload_error_on_missing_stress" in cfg_yaml:
+        cfg.preload_cfg.error_on_missing_stress = bool(
+            cfg_yaml.get("preload_error_on_missing_stress")
+        )
 
     seq_overrides = cfg_yaml.get("preload_sequence", None)
     if seq_overrides:

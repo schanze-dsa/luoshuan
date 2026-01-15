@@ -38,6 +38,8 @@ class PreloadConfig:
     epsilon: float = 1e-12     # 数值安全项
     work_coeff: float = 1.0    # 预紧功系数，可按需要扩展
     rank_relaxation: float = 0.0  # 顺序相关的松弛系数 (0 -> 不考虑顺序)
+    warn_on_missing_stress: bool = True   # warn if stress head missing in residual
+    error_on_missing_stress: bool = False # raise if stress head missing in residual
     # 可选：前向分块大小（若未在 cfg 里设置，也可由 _u_fn_chunked 内部默认取 2048）
     # forward_chunk: Optional[int] = None
 
@@ -178,6 +180,7 @@ class PreloadWork:
     def __init__(self, cfg: Optional[PreloadConfig] = None):
         self.cfg = cfg or PreloadConfig()
         self._bolts: List[BoltSampleData] = []
+        self._warned_missing_stress: bool = False
 
     # --------- 构建 ---------
     def build_from_specs(self, asm, specs: List[BoltSurfaceSpec],
@@ -573,6 +576,33 @@ class PreloadWork:
 
         P = tf.convert_to_tensor(params.get("P", [0.0, 0.0, 0.0]), dtype=tf.float32)
         nb = len(self._bolts)
+        nb_tf = tf.constant(nb, dtype=tf.int32)
+        p_len = tf.shape(P)[0]
+
+        def _pad():
+            pad = nb_tf - p_len
+            zeros = tf.zeros((pad,), dtype=tf.float32)
+            return tf.concat([P, zeros], axis=0)
+
+        def _truncate():
+            return P[:nb]
+
+        P = tf.cond(p_len < nb_tf, _pad, _truncate)
+        P = P[:nb]
+
+        stage_rank = params.get("stage_rank", None)
+        if stage_rank is not None:
+            rank_vec = tf.convert_to_tensor(stage_rank, dtype=tf.float32)
+            rank_vec = rank_vec[:nb]
+            relax = float(getattr(self.cfg, "rank_relaxation", 0.0) or 0.0)
+            if relax != 0.0:
+                if nb > 1:
+                    coeff = tf.constant(relax, dtype=tf.float32)
+                    center = tf.constant(0.5, dtype=tf.float32)
+                    scale = 1.0 + coeff * (center - rank_vec)
+                else:
+                    scale = tf.ones_like(rank_vec)
+                P = P * scale
 
         # Always compute bolt_deltas for force-then-lock usage.
         deltas = []
@@ -583,6 +613,26 @@ class PreloadWork:
         stats = {"preload": {"bolt_deltas": delta_vec}}
 
         if stress_fn is None:
+            if self.cfg.warn_on_missing_stress or self.cfg.error_on_missing_stress:
+                pmax = None
+                if tf.executing_eagerly():
+                    try:
+                        pmax = float(tf.reduce_max(tf.abs(P[:nb])).numpy())
+                    except Exception:
+                        pmax = None
+                has_load = (pmax is None) or (pmax > 0.0)
+                if has_load:
+                    if self.cfg.error_on_missing_stress:
+                        raise RuntimeError(
+                            "[PreloadWork] residual() requires stress_fn to compute axial force. "
+                            "Enable the stress head (stress_out_dim=6) or disable w_pre."
+                        )
+                    if self.cfg.warn_on_missing_stress and not self._warned_missing_stress:
+                        print(
+                            "[PreloadWork] WARNING: stress_fn is None; preload residual is disabled "
+                            "(L_pre=0). Enable stress_out_dim=6 or set w_pre=0."
+                        )
+                        self._warned_missing_stress = True
             return tf.constant(0.0, dtype=tf.float32), stats
 
         forces = []

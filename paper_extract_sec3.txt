@@ -1,0 +1,251 @@
+
+
+=== PAGE 5 ===
+
+J. Bai et al.
+If gradient descendant algorithms are selected, the pseudo-velocity of the displacement mappings by neural networks during
+training can be approximately calculated by
+𝜕 𝑢
+𝜕 𝑡 ≈ − 𝜕 𝐹(𝒙; 𝜽)T
+𝜕𝜽
+𝜕 𝛱
+𝜕𝜽, (11)
+where 𝐹(𝒙; 𝜽) is the neural network displacement mapping, as presented in Eq. (1). Moreover, the increment of displacement can
+obtained by
+𝛥𝑢≈ 𝜂𝜕 𝑢
+𝜕 𝑡. (12)
+The derivation is given in Appendix A. These equations can be further verified by Fig. 1(b) and (c). As observed, the pseudo-velocity
+can effectively predict the displacement increment during training when the VGD algorithm is selected. Although small departures
+can be observed when using the ADAM optimiser, the overall pseudo-velocity is quite similar to the displacement increment after
+the energy loss is stabilised. It should be noted that the pseudo-dynamics nature exhibited by neural network training is not identical
+to second-order ordinary differential systems. In addition, the VGD converges faster at the beginning of the training. However, for
+complex nonlinear problems, the VGD may trapped in local optima, while the ADAM optimiser can provide more reliable predictions
+(see Appendix B). We highlight that the pseudo-dynamics nature of the energy-based PINN can be utilised as a gradual loading
+process till the equilibrium state, equivalent to the iterative solvers in the traditional methods when dealing with nonlinear problems.
+Besides, the pseudo-velocity can help properly select the learning rate so that no penetration will happen during the training process.
+Those numerical techniques are explained in the following section.
+3. Frictionless contact potentials and numerical implementations
+3.1. Frictionless surface contact potential
+In general contact problems, consider two bodies are getting close to each other, as shown in Fig. 2(a). From the microscopic
+point of view, it is the molecular and atom forces between two bodies that prevent them from penetrating each other. Such repulsive
+phenomenon is usually described by potentials, for example, the well-known Lennard-Jones (LJ) potential [62], as presented in
+Fig. 3(a). Therefore, bringing this idea to the macroscale, a penalty-liked surface contact potential can be used to mimic the
+microscopic LJ potential between molecules and atoms. In this case, the overall potential energy of the conservation system can be
+re-written as
+𝛱 = 𝐸in − 𝐸ex + 𝐸c, (13)
+where 𝐸c is the surface contact potential energy and can be obtained by [63]
+𝐸c = ∫𝛤1 ∫𝛤2
+𝛽1𝛽2𝜙(𝑟)d𝛤1d𝛤2, (14)
+where 𝜙 and 𝑟 are the surface contact potential and the relative distance between contact surfaces, respectively. 𝛽 is the surface
+density. The subscribes 1 and 2 denote the two contact surfaces. As observed, surface integrations are done on both surfaces of
+bodies. It is clear to find that the LJ potential is not a monotonic function, where it goes down first and then increases sharply when
+𝑟→ 0. Nevertheless, given that this non-monotonic area only appears when the distance between the atom and molecular is close
+enough, which generally does not appear in the macroscopic contact problems. Therefore, a monotonic function can be applied as
+the surface contact potential, as long as the macroscopic potential increases steeply when 𝑟 → 0 and decays fastly when 𝑟 → ∞.
+Here, an exponential form potential is applied in this work and defined as
+𝜙(𝑟) = 𝜙0 exp
+(
+− 𝑟
+𝑟0
+)
+, (15)
+where 𝜙0 and 𝑟0 are the pre-defined potential constant and the effective radius of the discrete points, respectively. The plot of the
+repulsive potential is given in Fig. 3(b). Therefore, the corresponding contact force can be calculated by
+𝑭c = ∫𝛤1 ∫𝛤2
+𝛽1𝛽2
+𝜕 𝜙(𝑟)
+𝜕𝒓 d𝛤1d𝛤2
+= ∫𝛤1 ∫𝛤2
+−𝛽1𝛽2
+𝜙0
+𝑟0
+𝒓
+𝑟 exp
+(
+− 𝑟
+𝑟0
+)
+d𝛤1d𝛤2.
+(16)
+It is worth noting that the idea of using the surface potential for contact problems has been implemented in [63]. Besides, the rigorous
+derivations regarding the contact forces and variational formulation have been discussed in detail. However, in the framework of
+the proposed energy-based PINN, the potential energy functional is directly used and is minimised by powerful neural network
+optimisers. Meanwhile, we note that contact potentials can be in different forms and not necessarily identical to Eq. (15). Other
+contact potentials can be selected according to different contact problems. More contact potentials can be found in [63]. This work
+will only focus on demonstrating the effectiveness of the proposed PINN framework for contact problems. Therefore, only one contact
+potential is tested in the following numerical examples.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+5 
+
+
+=== PAGE 6 ===
+
+J. Bai et al.
+Fig. 2. Schematics of contact model discretisation [1]. (a) Point-to-point contact model. (b) Point-to-surface model.
+Fig. 3. (a) The Lennard-Jones potential plot; (b) The exponential form surface contact potential used in this work. Note that the 𝜙0 and 𝑟0 are the pre-defined
+potential constant and the effective radius of the discrete points, respectively.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+6 
+
+
+=== PAGE 7 ===
+
+J. Bai et al.
+To numerically obtain the surface contact potential energy, sample points are placed to the possible contact area on both surfaces
+of the two bodies. In this work, this kind of contact model is called the point-to-point (PP) model, as shown in Fig. 2(a). Such kind
+of contact model can generally apply to different irregular geometries.
+For some cases where regular geometry is used, as shown in Fig. 2(b). In these scenarios, only discrete sample points are placed
+on the irregular surface. In this work, we call this kind of contact model the point-to-surface (PS) model. Therefore, the surface
+contact potential energy of the PS contact model can be simplified as
+𝐸c = ∫𝛤1
+𝛽1𝜙(𝑟)d𝛤1, (17)
+where 𝑟 is always perpendicular to the surface of the regular surface. Such a PS model is less generalised but can greatly improve
+both computational efficiency and accuracy. In the following numerical examples, both the PP and the PS models are applied to
+deal with different contact scenarios. More detailed discussions between those two contact models are available in Section 3.4.
+It is worth noting that, such contact potential can also be used to describe the frictional contact phenomenon. However, in this
+work, we only use this potential to deal with frictionless contact problems. The friction force is a non-conservative force. Hence,
+frictional contact problems will be covered in our future work.
+3.2. Numerical implementation
+As shown in Eq. (15), the distances between the contact boundary nodes are necessary. Here, all the formulas are based on 2D
+problems and they can be easily extended to 3D scenarios. Consider the numbers of contact points on the potential contact surfaces
+are 𝑛 and 𝑚, respectively. The relative distance between contact points can be stored in a matrix of size 𝑛× 𝑚
+𝑟𝑛×𝑚 =
+√
+(𝛥𝒖)2 + (𝛥𝒗)2, (18)
+where
+𝛥𝒖𝑛×𝑚 = 𝒙𝑛×1 ⊗𝟏𝑚×1 − (𝒙𝑚×1 ⊗𝟏𝑛×1)T
+𝛥𝒗𝑛×𝑚 = 𝒚𝑛×1 ⊗𝟏𝑚×1 − (𝒚𝑚×1 ⊗𝟏𝑛×1)T (19)
+where 𝟏 is the vector of ones, and the notation ⊗ denotes the outer product. In Python, the outer product can be directly used as
+the multiplication by TensorFlow2. Therefore, the potential between each pair of points can be calculated as
+𝜙(𝑟)𝑛×𝑚 = 𝜙0 exp
+(
+− 𝑟𝑛×𝑚
+𝑟0
+)
+. (20)
+This equation is then substituted into Eq. (14) to calculate the overall contact potential. We note that the above implementation is
+compatible with the automatic differentiation technique. Thus, the contact energy added to the final loss can be directly minimised
+by neural network optimisers. The overall PINN framework proposed for contact problems is shown in Fig. 4.
+3.3. Relaxation, gradual loading and output scaling
+After initialising neural networks, the displacement mappings were established. However, those randomly built-up mappings
+may cause the multiple bodies to overlap with each other, as the example shown in Fig. 5(a–e). Therefore, to avoid the overlapping
+issue, relaxation can be applied first before solving problems. In relaxation, the contact potential is not activated in the loss function.
+In this manner, the neural network displacement mappings will be trained to dissipate the overall potential energy, and eventually
+reach their undeformed states, as shown in Fig. 5(f).
+As mentioned in Section 2.3, neural network training has a pseudo-dynamics nature. If the increment of one training epoch
+goes too far, the contact bodies may penetrate each other. To address this problem, the learning rate of training should be properly
+selected based on the pseudo-velocity assessed by Eq. (11). Moreover, since the soft boundary condition imposition technique is
+applied for the moving boundary conditions, a gradual loading formula can be applied to circumvent the body penetration
+𝛱EBC(𝑡) = 1
+𝑛
+∑
+‖𝒖(𝒙) − 𝑡
+𝑡max
+̄𝒖(𝒙)‖2
+2, (21)
+where 𝑡 is the current training epoch and 𝑡max is the maximum training epoch, 𝑛 is the number of sample points on the essential
+boundary. As such, the soft boundary condition is gradually imposed through the training loop. We also highlight that, when the
+displacement boundary condition is roughly fulfilled with a small residual and the contact system is stabilised, the hard boundary
+imposition techniques can be then utilised instead.
+In general, the initialising schemes for neural networks are likely to confine the initial output of neural networks within the
+range of [−1,1]. Furthermore, given that bias is typically not assigned to the final hidden layer in neural networks, the significant
+responsibility for scaling the output value is placed on the weights of this layer when solely the tanh activation function is employed.
+Hence, when the displacement fields only have small deformation, the training of neural networks will be very difficult and
+time-consuming. To address this problem, the output scaling factors are added to the established neural network mapping (Eq. (9))
+𝑢(𝒙) = 𝜉(𝑭(𝒙) ⊙𝒈(𝒙) + ̄𝒖(𝒙)), (22)
+where 𝜉 is the pre-defined scaling factor. The output scaling is used in the following benchmark problems (the Hertz contact
+problems).
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+7 
+
+
+=== PAGE 8 ===
+
+J. Bai et al.
+Fig. 4. The schematic of the proposed energy-based PINN framework for contact problems.
+Fig. 5. The multiple bodies overlapping issue caused by neural network initialisations and the relaxation scheme. (a) Consider two circles (both radius is 0.5 m)
+placed at (0,0.5) and (0,−0.5). The displacement fields 𝑢 and 𝑣 of each circle are predicted by two individual neural networks. (b–e) The initial configurations of
+circles predicted by neural networks after initialisation without training. Overlapping between two circles can be observed. (f) The loss histogram of two circles
+by the relaxation scheme. Note that the ADAM optimiser is used with a learning rate of 1 × 10−4.
+3.4. Benchmark tests and discussions
+Using the aforementioned framework, the 2D Hertz contact problem is analysed. The problem is under the assumption of small
+deformation. A half cylinder is compressed on a rigid horizontal plane, as shown in Fig. 6(a). A uniform pressure of 𝐹 = 0.5 N/m
+is subjected to be top of the half cylinder. A linear elastic material is considered, where Young’s modulus 𝐸 = 200 Pa and Poisson’s
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+8 
+
+
+=== PAGE 9 ===
+
+J. Bai et al.
+Table 1
+The mean absolute percentage error of PINN predictions by using different 𝑟0, 𝜙0 and contact models. PS and
+PP refer to point-to-surface and point-to-point, respectively. For modelling with varying 𝑟0 and 𝜙0, 𝜙0 and 𝑟0 are
+fixed to 1 × 104 and 1 × 10−5, respectively.
+Contact model 𝑟0 𝜙0
+1 × 10−3 1 × 10−4 1 × 10−5 1 × 102 1 × 104 1 × 106
+PS 15.40% 4.40% 3.87% 5.11% 3.87% 3.39%
+PP 18.31% 11.71% 6.83% ∖ 6.83% 4.98%
+Table 2
+The relative mean absolute error (RMAE) and GPU training time of the contact pressure predicted by the energy-
+based PINNs using different neural network sizes. The PP model is selected. 𝜙0 and 𝑟0 are 1 × 104 and 1 × 10−5,
+respectively. For each case, neural networks are trained 5 times and each training converges by 5 × 103 epochs.
+The network size is presented by the number of hidden layers times the number of neurons per layer.
+Network size RMAE P GPU time (s) Network size RMAE P GPU time (s)
+2 × 30 4.46% 159.40 3 × 20 7.58% 222.62
+3 × 30 4.02% 204.55 3 × 30 4.02% 204.55
+4 × 30 2.82% 261.46 3 × 40 3.20% 210.47
+ratio 𝜈= 0.3. The analytical solution is obtained from [64]. To solve this problem, two FNNs are built up to predict the displacements
+𝑈 and 𝑉, respectively. Each network contains 3 hidden layers and 30 neurons per layer. The scaling factor is 𝜉 = 1 × 10−3. Thus,
+the 𝑈 and 𝑉 outputs of neural networks are obtained by
+𝑈 = 𝜉 𝑥𝐹𝑥(𝑥, 𝑦),
+𝑉 = 𝜉 𝐹𝑦(𝑥, 𝑦),
+(23)
+where the hard boundary condition is applied to the 𝑈 prediction.
+The sample points distribution is shown in Fig. 6(b). In this work, the sample points inside the computational domain are
+generated following the Gaussian quadrature. Since the contact area is located at the bottom of the cylinder, refined sample points
+are applied near the contact area, as shown in Fig. 6(c). The ADAM optimiser is selected with a learning rate of 1 × 10−4. For each
+case, neural networks are trained 5 times and each training converges by 2 × 103 epochs. Both the point–plane and point-point
+contact models are tested.
+Fig. 6(d) shows the results produced by the PINN-based framework and the FEM. Fig. 6(e) further shows the absolute error
+contours of displacement fields of the proposed PINN frameworks. The mean absolute error of the predicted 𝑈 and 𝑉 fields by
+using the PP model are respectively 3.89 × 10−6 N/m2 and 2.15 × 10−4 N/m2, while those of the PS model are respectively 4.36 × 10−6
+N/m2 and 1.28 × 10−4 N/m2. All predicted contours are in good agreement with the reference results. Fig. 6(f) and (g) plots the
+contact pressure obtained by the PINN-based framework and Table 1 lists the mean relative percentage errors of PINN predictions
+with different contact models. The discussion starts with using different 𝑟0 while a fixed 𝜙0 of 1 × 104 is applied. We note that 𝑟0
+here also controls the spacing of the contact sample points on the contact area, in other words, a decreasing 𝑟0 will induce more
+contact points on the same length of a contact boundary. With decreasing selections of 𝑟0, the predicted contact pressure fits the
+analytical solution better, especially near the area of the transition point from contact to the free surface, as shown in Fig. 6(e). It
+is rational since it should converge to the analytical solution with decreasing selection of 𝑟0, analogous to the real atom model used
+in molecular dynamics. When changing the value of 𝜙0 and fixing 𝑟0 = 1 × 10−5 m, it is found that the accuracy of the results is not
+very sensitive to different 𝜙0, as shown in Fig. 6(f). It is also worth noting that, when using the PP contact model, the cylinder can
+penetrate the substrate plane if too small 𝜙0 is selected. Notably, 𝜙0 is similar to the penalty factors in the penalty method when
+imposing the essential boundary conditions. Moreover, it can be found that the framework with the PS model can achieve greater
+accuracy. Despite the relatively large discrepancy, the framework with the PP contact model is still effective enough to accurately
+capture the stress concentration patterns near the contact area, as presented in Fig. 6(d). Therefore, for irregular contact surfaces,
+the PP contact model is used instead of the PS contact model.
+Finally, Table 2 presents the computational accuracy and efficiency of the energy-based PINNs with respect to different neural
+network sizes. With increasing numbers of layers and neurons per layer, neural networks can provide more accurate contact
+pressure predictions. However, the computational efficiency decreases due to the increasing number of trainable parameters in
+larger networks. Notably, training networks of the 3 × 20 size costs more time than larger networks. This is because a GPU is
+used. The GPU spends more time in accessing data rather than calculations. The computational efficiency should be increased with
+decreasing size of networks if a CPU is used.
+4. Numerical examples
+Herein, three frictionless contact problems with material and geometric nonlinearities are conducted to test the performance of
+the proposed framework. In all cases, the hyperelastic Neo-Hookean material is applied. Relaxation is also applied before all loading
+processes. The plain strain condition is considered. The neural network is built up by the TensorFlow 2 library in Python. The ADAM
+optimiser is selected with a learning rate of 1 × 10−5. All the problems are modelled on a 12th Gen Intel(R) Core(TM) i5-12490F
+CPU (3.0 GHz) and with a Geforce 4060 Ti GPU.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+9 
+
+
+=== PAGE 10 ===
+
+J. Bai et al.
+Fig. 6. Results for the Hertz contact problem. (a) The configuration of the Hertz contact problem; (b) The sample points distribution in the computational
+domain; (c) The refined sample points near the contact area. (d) Comparisons of the displacement and stress contours from the proposed PINN frameworks and
+the FEM. (e) The absolute error contours of the PINN frameworks. (f) Comparisons of the contact pressure plots with different 𝑟0; (g) Comparisons of the contact
+pressure plots with different 𝜙0. PS and PP refer to point-to-surface and point-to-point.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+10 

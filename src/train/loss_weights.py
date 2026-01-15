@@ -486,9 +486,9 @@ def combine_loss(
     loss = tf.constant(0.0, dtype=tf.float32)
 
     # Certain energy contributions (e.g. external work) enter the potential with
-    # a negative sign.  Keep a small map of such terms so combine_loss stays
-    # consistent with TotalEnergy.Pi's baseline formulation even when adaptive
-    # weighting is enabled.
+    # a negative sign.  Residual-only mode must override this to a positive sign.
+    # Keep a small map of such terms so combine_loss stays consistent with the
+    # chosen formulation when adaptive weighting is enabled.
     sign_overrides = state.sign_overrides
     if sign_overrides is None:
         sign_overrides = {

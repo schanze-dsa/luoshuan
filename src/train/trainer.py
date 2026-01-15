@@ -2697,9 +2697,10 @@ class Trainer:
 
         adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
         loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
-        sign_overrides = None
         if loss_mode in {"residual", "residual_only", "res"}:
             sign_overrides = {"W_pre": 1.0}
+        else:
+            sign_overrides = {"W_pre": -1.0}
         if adaptive_enabled:
             scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
             focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())

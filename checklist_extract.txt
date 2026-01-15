@@ -1,0 +1,163 @@
+3D 摩擦接触 DFEM/PINN 改造实现清单
+ALM（法向）+ 增量耗散（切向）+ 分段加载与动态初值（收敛增强）
+版本：v1.3
+面向：现有 TensorFlow DFEM/PINN 工程（src/ + main.py + config.yaml）
+编制：技术方案稿
+日期：2026-01-14
+1. 改造目标与边界条件
+目标：在三维摩擦接触问题中，保持弹性部分的能量一致性，同时避免将库仑摩擦错误地势能化，从而显著提升训练/求解的稳定性与可收敛性。
+本清单给出的最终框架满足以下约束：
+法向接触采用 Augmented Lagrangian Method（ALM）执行不可穿透与接触压力非负（互补约束）。
+切向摩擦采用增量耗散（incremental dissipation），以切向滑移增量 Δs_t 为核心状态量；不再将摩擦作为可逆势能纳入经典最小总势能。
+训练采用分段加载（stage-wise loading）与动态初值（warm-start / rolling reference），并与接触点重采样机制兼容。
+允许在训练早期采用平滑摩擦（C1 regularization）并逐步过渡到更严格的摩擦圆锥投影/互补结构（continuation）。
+2. 目标架构（最终收敛方案）
+建议采用三层循环训练组织，保证 ALM 与摩擦历史量的一致性：
+加载步（Stage, m=1..M）：外载/预紧/位移按阶段推进（建议先压后滑）。
+ALM 外循环（k=1..K）：更新法向乘子 λ_n（必要时递增罚因子 rho_n 或 mu_n）。
+网络内循环（inner optimizer）：Adam 为主、LBFGS 作为收尾（可选）；每若干步执行一次乘子更新。
+关键状态量需要跨阶段继承：
+网络参数 θ（warm-start）。
+法向乘子 λ_n（按接触点/采样点）。
+切向历史滑移 s_t^{m-1} 或其等价表征（用于构造 Δs_t）。
+接触点集合发生重采样时，必须在新点集上用上一阶段构型重建参考状态（避免 Δs_t 失配）。
+3. 改造实现清单总览（按优先级）
+表 3-1 为必须完成项（P0）。表 3-2 为推荐增强项（P1/P2）。
+3.1 P0：必须完成项
+编号
+改造主题
+涉及文件/模块
+实现要点
+备注
+优先级
+P0-01
+训练主循环：分段加载 + 动态初值
+train/trainer.py
+实现 Stage/ALM/Inner 三层循环；缓存 prev_stage_params；重采样后用 prev_stage_params 重新 capture_reference。
+关键：Δs_t 一致性与 warm-start
+P0
+P0-02
+摩擦：启用增量滑移 Δs_t
+physics/contact/contact_friction_alm.py
+use_delta_st=True；维护 st_ref；能量与更新统一用 Δs_t。
+避免摩擦势能化与方向抖动
+P0
+P0-03
+法向：ALM 状态与更新节奏
+physics/contact/contact_normal_alm.py；model/loss_energy.py
+λ_n 跨 inner step 继承；每 N 步更新；投影保证 λ_n>=0；提供 get_state/set_state。
+穿透量应稳定下降
+P0
+P0-04
+重采样：历史量重建
+mesh/contact_pairs.py；train/trainer.py
+重采样后在新点集上用上阶段网络预测位移，重建 s_t^{m-1}（或其等价历史量）。
+消除 Δs_t 非物理跳变
+P0
+P0-05
+配置：关键开关与 schedule
+config.yaml；TrainerConfig
+新增 incremental_mode、use_delta_st_friction、smooth_to_strict、rho/beta/eps 退火等字段。
+保证可复现实验
+P0
+3.2 P1/P2：推荐增强项
+编号
+改造主题
+涉及文件/模块
+实现要点
+备注
+优先级
+P1-01
+Continuation：平滑 -> 严格摩擦
+contact_friction_alm.py；train/trainer.py
+use_smooth_friction=True；smooth_blend 1->0；eps 大->小。
+早期更稳，后期更准
+P1
+P1-02
+RAR：摩擦残差参与重采样
+mesh/contact_pairs.py；train/trainer.py
+穿透残差与摩擦残差混合抽样；保留 uniform 比例避免过拟合热点。
+更快收敛
+P1
+P1-03
+动态初值：滚动更新 best state
+train/trainer.py
+跟踪 VI-error/penetration 指标，若改善则更新 reference（Algorithm-3 风格）。
+减少陷入坏初值
+P1
+P2-01
+严格 stick-slip（互补/NCP）
+physics/contact/*
+需要时再升级：摩擦锥互补 + 流动法则残差（复杂度高）。
+最严格但成本大
+P2
+4. 详细改造项（可直接用作开发 Checklist）
+4.1 P0：训练主循环（Stage-ALM-Inner 三层循环）
+[ ] 在 train/trainer.py 中显式实现 stage 循环：前若干 stage 仅法向加载（压紧），后续 stage 叠加切向加载（滑移）。
+[ ] 在每个 stage 开始时缓存 prev_stage_params（上一阶段网络参数快照），作为重采样后的参考构型来源。
+[ ] 在每个 stage 内实现 ALM 外循环：每轮包含 inner 训练若干步 + 乘子更新（Normal/Friction），并定义停机准则（穿透量下降到阈值或改进率不足）。
+[ ] inner 训练建议：Adam 为主（稳定），必要时对每个 stage 的最后一轮加 LBFGS 收尾（可选）。
+[ ] 所有与摩擦历史量相关的 reference（如 s_t^{m-1}）必须在 stage 边界明确更新并持久化。
+4.2 P0：接触点重采样后的参考状态重建（解决 Δs_t 失配）
+[ ] 若启用 resample_contact_map：重采样后立即在新接触点上用 prev_stage_params 前向预测 u^{m-1}。
+[ ] 在新接触点集上计算 s_t^{m-1}（或等价历史量），并作为 friction operator 的 reference 缓存（capture_reference）。
+[ ] 禁止在重采样后直接复用旧点集的 s_t^{m-1}（会导致 Δs_t 发生非物理跳变）。
+[ ] 为便于调试，记录重采样前后 Δs_t 的统计量（mean/max/percentiles），用于快速定位发散源。
+4.3 P0：法向 ALM（NormalContactALM）状态管理与乘子更新
+[ ] 在 physics/contact/contact_normal_alm.py 中提供 get_state()/set_state()，用于跨 step/stage 继承 λ_n。
+[ ] 确保 update_multipliers(...) 使用 step_scale（eta）控制更新步长，并对 λ_n 做非负投影。
+[ ] 在 model/loss_energy.py 或 train/trainer.py 中统一乘子更新节奏：建议每 update_every_steps 更新一次，而非每一步更新。
+[ ] 增加 stats 输出：穿透量 v_n 的 mean/max、有效接触比例、λ_n 的 mean/max，作为收敛监控指标。
+4.4 P0：切向摩擦（FrictionContactALM）从绝对滑移切到增量滑移
+[ ] 在 physics/contact/contact_friction_alm.py 中开启 use_delta_st=True（即 use_delta_st_friction）。
+[ ] 新增并维护切向 reference：st_ref（上一阶段或上一参考构型的 s_t），并以 Δs_t = s_t - st_ref 作为摩擦能量与更新输入。
+[ ] 训练阶段建议启用 use_smooth_friction=True，使用平滑耗散路径（psi）并配合 smooth_s0/eps 退火；收尾阶段可将 smooth_blend 逐步降至 0，过渡到更严格的圆锥投影残差。
+[ ] 在 update_multipliers(...) 中确保使用一致的 Δs_t（与 energy 中同一口径），避免能量与更新不一致。
+4.5 P0：配置与可复现实验（config.yaml）
+[ ] 新增/确认以下关键字段并在 main.py -> TrainerConfig 映射：incremental_mode、preload_staging、stage_resample_contact、reset_contact_state_per_case。
+[ ] 在 friction_config 中开放：use_delta_st_friction、use_smooth_friction、smooth_s0、eps、smooth_blend schedule（或 smooth_to_strict）。
+[ ] 在 normal_contact_config 中开放：beta、mu_n（或 rho_n）、update_every_steps、step_scale。
+[ ] 将所有 schedule（rho、beta、eps、smooth_blend、mu_eff）写入 config.yaml，避免仅靠代码硬编码。
+4.6 P1：Continuation 与自适应采样（推荐）
+[ ] 实现 smooth_blend 退火：训练前期 1.0（更平滑），后期逐步降到 0（更严格）。
+[ ] 实现 eps 退火：从较大值逐步减小（避免早期梯度爆炸与方向抖动）。
+[ ] 实现 contact_rar（RAR）对摩擦残差的混合抽样：score = a*penetration_res + (1-a)*friction_res，并保留 uniform 比例。
+[ ] 实现 mu_eff 递增：先用较小摩擦系数训练稳定接触，再渐进到目标 mu。
+4.7 P1：动态初值滚动更新 best state（监控 VI/Penetration）
+[ ] 定义 VI-error 或工程等价指标：例如穿透残差与摩擦锥残差的组合范数。
+[ ] 在每个 stage 内跟踪 best_state（min error 的网络权重与 reference），若持续改善则更新 reference（Algorithm-3 风格）。
+[ ] 设置 improvement rate（IR）阈值：若连续若干轮无改善则切换 stage 或增大 rho/beta（而不是盲目加大学习率）。
+4.8 P2：严格 stick-slip / 互补（如需最高物理严格性）
+[ ] 当需要严格 stick/slip 判别时，引入互补变量并对摩擦锥屈服函数 phi = ||t_t|| - mu*lambda_n <= 0 做 NCP 处理（FB/min 函数）。
+[ ] 为保证可训练性，建议先在增量耗散路线收敛后再升级到互补版本，并保留 continuation 与 warm-start。
+5. 验收标准（建议写入项目 README）
+建议以可量化指标验收收敛与物理一致性，避免仅凭可视化主观判断。
+法向穿透
+max(v_n) < tol_n；且随 stage/迭代单调或准单调下降（建议 tol_n=1e-4~1e-3 * 特征长度）
+法向乘子
+lambda_n >= 0 全程满足；mean/max 不出现非物理爆炸（可设置上限告警）
+摩擦锥一致性
+||t_t|| <= mu * p_eff + tol_f；超限比例 < 1%（或按接触点权重统计）
+能量/耗散一致性
+在纯摩擦滑移阶段：耗散 D(Δs_t) 非负；外载不变时存储能不出现无解释增长
+训练稳定性
+loss 不出现长期 NaN/Inf；梯度范数在合理区间（建议记录并设定告警阈值）
+可复现性
+同一配置重复运行，关键指标（max penetration、终态位移 RMS）差异 < 指定阈值
+6. 推荐参数与退火策略（默认模板）
+以下范围用于先稳后严的 continuation；实际取值需结合几何尺度、材料刚度与量纲归一化。
+法向 softplus：beta 建议 20 -> 200 递增（先软后硬）。
+法向 ALM 罚因子（mu_n/rho_n）：从 1e2~1e3 起步；穿透停滞时按 1.5~3 倍递增。
+摩擦平滑：eps 从 1e-4~1e-6（相对位移尺度）递减；smooth_s0 从 1e-2*L -> 1e-4*L 递减。
+摩擦 blend：smooth_blend 从 1.0 线性退火到 0.0（例如占总步数 60%）。
+摩擦系数：mu_eff 从 0.2*mu -> mu 递增（可选，但对稳定性帮助显著）。
+乘子更新步长：step_scale(eta) 默认 1.0；若振荡可降到 0.3~0.7。
+7. 交付物与文件级变更清单（建议）
+完成 P0 后，建议将变更以可审计形式提交，便于后续扩展与论文复现：
+更新：config.yaml（新增字段与默认 schedule）。
+更新：train/trainer.py（Stage/ALM/Inner 三层循环 + reference 重建）。
+更新：physics/contact/contact_friction_alm.py（Δs_t、reference、smooth-to-strict）。
+更新：physics/contact/contact_normal_alm.py（state 管理、统计输出、更新节奏）。
+更新：mesh/contact_pairs.py（重采样接口与辅助输出）。
+新增（推荐）：train/metrics_contact.py（收敛指标统一计算与日志）。
+新增（推荐）：tests/test_contact_ops.py（单元测试与回归测试）。

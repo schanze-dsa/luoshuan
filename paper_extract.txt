@@ -1,0 +1,332 @@
+Contents lists available at ScienceDirect
+Comput. Methods Appl. Mech. Engrg.
+journal homepage: www.elsevier.com/locate/cma
+Energy-based physics-informed neural network for frictionless
+contact problems under large deformation
+Jinshuai Bai a,b
+ , Zhongya Lin a, Yizheng Wang c,e
+ , Jiancong Wen b,d, Yinghua Liu c,
+Timon Rabczuk e, YuanTong Gu b
+ ,∗, Xi-Qiao Feng a,∗
+a Institute of Biomechanics and Medical Engineering, AML, Department of Engineering Mechanics, Tsinghua University, Beijing, 100084, China
+b School of Mechanical, Medical and Process Engineering, Queensland University of Technology, Brisbane, 4000, Queensland, Australia
+c Department of Engineering Mechanics, AML, Tsinghua University, Beijing, 100894, China
+d Institute of Aeronautics and Astronautics, Nanchang University, Nanchang, 330031, China
+e Institute of Structural Mechanics, Bauhaus Universität Weimar, Weimar, 99423, Thuringia, Germany
+A R T I C L E I N F O
+Keywords:
+Contact mechanics
+Physics-informed neural network
+Nonlinear computational mechanics
+Minimal of potential energy
+A B S T R A C T
+Numerical methods for contact mechanics are of great importance in engineering applications,
+enabling the prediction and analysis of complex surface interactions under various conditions.
+In this work, we propose an energy-based physics-informed neural network (PINN) framework
+for solving frictionless contact problems under large deformation. Inspired by microscopic
+Lennard-Jones potential, a surface contact energy is used to describe the contact phenomena.
+To ensure the robustness of the proposed PINN framework, relaxation, gradual loading and
+output scaling techniques are introduced. In the numerical examples, the well-known Hertz
+contact benchmark problem is conducted, demonstrating the effectiveness and robustness of
+the proposed PINN framework. Moreover, challenging contact problems with the consideration
+of geometrical and material nonlinearities are tested. It has been shown that the proposed
+PINN framework provides a reliable and powerful tool for nonlinear contact mechanics. More
+importantly, the proposed PINN framework exhibits competitive computational efficiency to the
+commercial FEM software when dealing with those complex contact problems. The codes used
+in this manuscript are available at https://github.com/JinshuaiBai/energy_PINN_Contact.
+1. Introduction
+Contact and interaction between objects are ubiquitous in nature and industrial production. Accurately simulating the deforma-
+tion of bodies during contact is crucial for understanding and predicting mechanical behaviour. Contact problems are inherently
+nonlinear and are a fundamental aspect of solid mechanics [1]. Over the years, significant efforts have been dedicated to addressing
+these problems, with mesh-based methods emerging as a predominant approach [2–5]. Additionally, meshless methods, employing
+both weak and strong formulations, have been proposed to tackle challenges in contact mechanics [6–10].
+The complexities of contact mechanics, such as contact discretisation and boundary smoothness, make it a particularly
+challenging area of study [11]. To overcome these challenges, isogeometric analysis (IGA) frameworks based on non-uniform rational
+B-splines (NURBS) have been developed. These frameworks enable exact representations of complex geometries and provide superior
+continuity properties [12–16]. Beyond issues of contact smoothness and discretisation, the enforcement of inequality constraints
+∗ Corresponding authors.
+E-mail addresses: yuantong.gu@qut.edu.au (Y. Gu), fengxq@tsinghua.edu.cn (X.-Q. Feng).
+https://doi.org/10.1016/j.cma.2025.117787
+Received 6 November 2024; Received in revised form 24 December 2024; Accepted 20 January 2025
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+Available online 30 January 2025 
+0045-7825/© 2025 Elsevier B.V. All rights are reserved, including those for text and data mining, AI training, and similar technologies. 
+
+J. Bai et al.
+represents another critical aspect of contact mechanics. Various numerical techniques, such as the Lagrange multiplier method, the
+augmented Lagrangian formulation, and mortar methods, have been extensively developed to address this issue [17,18].
+In recent years, a novel kind of deep learning (DL) framework [19,20], namely the physics-informed neural networks (PINNs),
+has merged as a powerful and promising tool for solving partial differential equations [21–24], and therefore attracted significant
+attention in the computational mechanics [25–28]. Numerous numbers of PINN-based computational solid mechanics frameworks
+have been proposed [29–32]. Among those frameworks, neural networks regulated by the energy form loss provide the most robust
+results with favourable efficiency. Those energy-based PINN frameworks are also known as the deep energy method (DEM) [31].
+Great performances of those PINN frameworks have been witnessed in a variety of applications, including linear elasticity [31,33],
+hyperelasticity [34], elastoplasticity [35,36], fracture [37–39], large deformation problems [40], and topology optimisation [41–
+44]. Besides, adaptive sampling strategies [45,46] have been proposed to avoid the overfitting issue and enhance the accuracy of
+predictions. In addition, traditional PDE solving techniques have been introduced to the energy-based PINN frameworks, ending up
+with establishing novel methods for solid mechanics challenges. For example, complementary energy form and boundary integration
+form lead to novel deep complementary energy method [47] and boundary-informed neural network frameworks [48], respectively.
+Novel neural network structures are also implemented. Bai et al. [40] applied radial basis networks to deal with problems
+involving both material and geometrical nonlinearity. It has been demonstrated that such a framework can easily capture instability
+phenomena and is locking-free when modelling nearly incompressible materials. Wang et al. [49] implement the Kolmogorov
+Arnold network (KAN) with physics knowledge. By doing so, the KAN shows exceptional performances for multi-scale and material
+discontinuity problems.
+Despite its notable success in computational mechanics, only limited exploration regarding PINNs has been conducted on
+contact problems. Sahin et al. [50] proposed a PINN framework under the strong form formulation with the classical Karush–
+Kuhn–Tucker constraint to solve the forward and inverse contact problems. Efforts have also been directed towards addressing
+interfacial discontinuities arising from the consideration of multi-material systems [51]. However, in those existing and limited
+literature, either small deformation problems are discussed or the contact surfaces remain unchanged throughout the training,
+e.g., neither new contact area generated nor sliding between contact surfaces is considered. It has been demonstrated that the
+PINN framework is very effective for material nonlinearities and large deformation problems [34,40]. Besides, the energy-based
+PINNs are computationally more efficient and robust than the vanilla PINNs [32]. Therefore, it is of great interest to implement
+energy-based PINNs to solve contact problems. Moreover, the effectiveness and performance of the energy-based PINNs for contact
+problems with complex nonlinearities are also worth investigating.
+To address this research gap, in this work, we propose an energy-based PINN framework for contact problems with both
+material and geometrical nonlinearities. The contact behaviour is described by a contact potential and together optimised by
+gradient descendant algorithms. Moreover, additional numerical treatments, including the relaxation, gradual loading and output
+scaling are also introduced to improve the robustness of the proposed framework. The Hertz contact benchmark problems under
+small deformation assumption are examined to show the performances of the proposed framework. More importantly, various
+contact examples considering both the material and the geometrical nonlinearities are tested, including the rubber ironing, the
+rubber ring contact instability and the compression of two rings. The deformed configurations and stress contours demonstrate the
+effectiveness and substantial potential of the proposed PINN framework for complex nonlinear mechanics. Notably, the proposed
+framework is very straightforward to implement numerically and can easily incorporate experimental data. Additionally, the PINN
+framework demonstrates competitive computational efficiency compared to commercial FEM software when addressing complex
+contact problems.
+The remainder of the paper is organised as follows: In Section 2, the basic conceptions of energy-based PINN for solid mechanics
+are briefly introduced. In Section 3, the frictionless contact achieved by using the surface potential and its implementation based
+on the PINN framework are proposed. The Hertz contact benchmark problem is also examined and discussed in detail. In Section 4,
+numerical examples involving large deformation and material nonlinearities are presented, including the rubber ironing, the rubber
+ring contact instability and the compression of two rings. In Section 5, the conclusions of this work are summarised.
+2. Energy-based PINN for nonlinear solid mechanics
+2.1. Loss function informed by potential energy
+We first recap the basic conceptions of the energy-based PINN in solid mechanics. In this method, neural networks are used to
+approximate the admissible displacement solution 𝒖(𝒙) satisfying the essential boundary condition:
+𝒖(𝒙) ≈ 𝑭(𝒙; 𝜽)
+𝒖(𝒙) = ̄𝒖(𝒙), 𝒙∈ 𝛤𝒖 (1)
+where 𝑭(⋅) denotes a neural network mapping and 𝜽denotes the trainable parameters in the network. ̄𝒖(𝒙) is the prescribed essential
+boundary conditions on essential boundary 𝛤𝒖. Note that the neural network structure has been introduced in many PINN-based
+computational mechanics literature, and different types of neural networks can be found in [52–54]. Referring to the principle
+of minimum potential energy, the solution to the solid mechanics problem can be obtained by finding a 𝒖(𝒙) that minimises the
+potential energy of the solid system
+𝒖(𝒙) = ar g min
+𝒖(𝒙)
+𝛱(𝒖(𝒙)), (2)
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+2 
+
+J. Bai et al.
+where 𝛱(⋅) is the overall potential energy functional and can be calculated by
+𝛱 = 𝐸in − 𝐸ex, (3)
+where 𝐸in and 𝐸ex are the strain energy and the potential energy of external forces, respectively. For elastic material, the strain
+energy can be calculated by
+𝐸in = ∫𝛺
+𝛹(𝑭)d𝛺 , (4)
+where 𝛹(⋅) and 𝑭 are the strain energy density and deformation gradient tensor, respectively [55]. The potential energy of external
+forces can be obtained by
+𝐸ex = ∫𝛤𝒕
+̄𝒕⋅ 𝒖d𝛤 , (5)
+where ̄𝒕is the given traction force on the natural boundary 𝛤𝒕. Many weak-form computational mechanics methods are established
+based on the principle of minimum potential energy, such as FEM, element free Galerkin (EFG) method [56] and point interpolation
+method (PIM) [57]. They are considered to be more stable than those based on the strong form formulation, and PINN-based
+computational mechanics frameworks are no exception [58]. It has been reported that energy-based PINNs are computationally
+more efficient and better at capturing the stress concentration [33,58].
+2.2. Boundary condition imposition
+As mentioned above, the natural (traction) boundary conditions are already embedded in the potential energy. Auxiliary
+techniques are required to impose the essential boundary conditions. Consider the essential boundary condition is defined on 𝛤𝒖
+𝒖(𝒙) = ̄𝒖(𝒙), 𝒙∈ 𝛤𝒖 (6)
+where ̄𝒖(𝒙) is the prescribed essential boundary conditions on 𝛤𝒖. Currently, the essential boundary conditions in energy-based
+PINNs can be imposed in soft or hard manners.
+The so-called ‘‘soft’’ boundary condition imposition technique in PINNs is also known as the penalty method [59]. It produces
+solutions that approximately satisfy essential boundary conditions. To implement it, a least-square functional, 𝛱EBC, is first
+formulated
+𝛱EBC = ∫𝛤𝑢
+‖𝒖(𝒙) − ̄𝒖(𝒙)‖2
+2d𝛤 = ∫𝛤𝑢
+([𝒖(𝒙) − ̄𝒖(𝒙)] ⋅ [𝒖(𝒙) − ̄𝒖(𝒙)]) d𝛤 , (7)
+where ‖ ⋅ ‖2 is the 2-norm on the essential boundary. As observed, 𝛱EBC only reaches its minimal value when the predicted
+displacements exactly equal the given boundary conditions. It is then added to the overall potential energy functional with a penalty
+factor 𝜅
+𝛱∗ = 𝛱+ 𝜅 𝛱EBC. (8)
+where 𝛱∗ is the modified energy functional. Referring to the penalty method, 𝜅 should be a positive factor. With increasing 𝜅,
+the solution obtained by Eq. (8) will recover to the solution of the original problem. In numerical implementation, residuals are
+inevitable on the essential boundaries, such penalty method is therefore called the soft boundary condition imposition technique.
+To impose the essential boundary conditions in the ‘‘hard’’ way, the neural network output is tailored so that it can naturally
+satisfy the essential boundary conditions
+𝒖(𝒙) = 𝑭(𝒙) ⊙𝒈(𝒙) + ̄𝒖(𝒙), (9)
+where ⊙ is the element-wise product, and the distance network 𝒈(𝒙) represents the shortest distance from a given point 𝒙 to the
+essential boundary:
+𝒈(𝒙) = min
+𝒚∈𝛤𝑢
+√
+‖𝒙− 𝒚‖2
+2 = min
+𝒚∈𝛤𝑢
+√
+(𝒙− 𝒚) ⋅ (𝒙− 𝒚). (10)
+There are two main advantages of using the hard boundary condition imposition technique. First, the essential boundary
+condition can be exactly imposed. Second, the physics-informed loss function can include fewer loss terms. The neural network
+training can be regarded as a multi-task learning process if multiple loss terms exist in the final loss function. Using too many loss
+terms may induce the imbalance training issue, and thus hyperparameters are required to balance the residuals from different loss
+terms [29]. Tuning hyperparameters before each loss term can be annoying. For simple geometries, the explicit form of 𝒈(𝒙) can
+be obtained. For complex boundary geometries, the distance function can be constructed in replacement of 𝒈(𝒙). For more details,
+please refer to [60].
+In this study, the hard boundary condition enforcement technique is directly utilised to fixed boundary conditions. For
+displacement loading, the soft boundary condition enforcement is initially applied, followed by the use of the hard boundary
+condition technique.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+3 
+
+J. Bai et al.
+Fig. 1. (a) The training dynamics of energy-based PINNs for solving a cantilever beam (0.25 m ×1 m) problem with a linear elastic material. The Young’s
+modulus and the Poisson’s ratio are 1 × 104 Pa and 0.3, respectively. The left boundary of the beam is fixed. A parabolic distributed force of 10 𝑁 is downwardly
+applied on the right boundary. Two feedforward neural networks with 3 hidden layers and 5 neurons per layer are used for predicting displacements. When
+using gradient descendant algorithms, the overall potential energy decreases during the training of energy-based PINNs. The intermediate absolute displacement
+mappings are shown. Along with the decreasing energy functional, the beam seems to be dynamically bent to the equilibrium state. Note that the VGD in the
+figure refers to the vanilla gradient descendant algorithm. A learning rate of 1 × 10−4 is applied. (b) Comparisons between 𝜂𝜕𝒖
+𝜕 𝑡 and actual displacement increment
+when using the VGD at the 20000th epochs. (c) Comparisons between 𝜂𝜕𝒖
+𝜕 𝑡 and actual displacement increment when using the ADAM optimiser at the 20000th
+epochs.
+2.3. Neural network training and its pseudo-dynamic nature
+To solve the problem, optimisers are applied to minimise the loss function by iteratively adjusting those trainable parameters, 𝜽.
+Among all, gradient descendant optimisers have earned great favour due to their effectiveness and efficiency. Currently, the ADAM
+optimiser is the most popular optimiser in PINN training [61]. In the energy-based PINNs, the energy functional at a given set of
+displacement mappings is treated as the loss function. Therefore, the training of the energy-based PINN can be regarded as a way to
+dissipate the overall potential energy. In other words, the energy-based PINNs are trained in a pseudo-dynamic manner. This can be
+verified by the example shown in Fig. 1(a), where both the vanilla gradient descendant (VGD) algorithm and the ADAM optimiser are
+applied to train neural networks for a 2D cantilever beam problem. After initialisation, neural networks map to random displacement
+fields. During the training, with the decreasing of the potential energy functional, the intermediate displacement mappings are
+shown. Along with the decreasing energy functional, the beam seems to be dynamically bent to the equilibrium state. Eventually,
+the functional loss stably converges around 2 × 104 epochs. Meanwhile, it can be noticed that the bending rates of the beam vary from
+the use of different optimisers. The ADAM optimiser incorporates the momentum of the gradient information. Hence, it can adjust
+the learning rate of each trainable parameter. By so doing, the use of the ADAM optimiser can significantly avoid loss oscillations
+during training and enhance the training robustness.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+4 
+
+J. Bai et al.
+[16] L. De Lorenzis, İ. Temizer, P. Wriggers, G. Zavarise, A large deformation frictional contact formulation using NURBS-based isogeometric analysis, Internat.
+J. Numer. Methods Engrg. 87 (13) (2011) 1278–1300.
+[17] F. Fernandez, M.A. Puso, J. Solberg, D.A. Tortorelli, Topology optimization of multiple deformable bodies in contact with large deformations, Comput.
+Methods Appl. Mech. Engrg. 371 (2020) 113288, http://dx.doi.org/10.1016/j.cma.2020.113288, URL https://www.sciencedirect.com/science/article/pii/
+S0045782520304734.
+[18] B. Bozorgmehri, X. Yu, M.K. Matikainen, A.B. Harish, A. Mikkola, A study of contact methods in the application of large deformation dynamics in
+self-contact beam, Nonlinear Dynam. 103 (1) (2021) 581–616, http://dx.doi.org/10.1007/s11071-020-05984-x .
+[19] Y. LeCun, Y. Bengio, G. Hinton, Deep learning, Nature 521 (7553) (2015) 436–444.
+[20] G.-R. Liu, Machine Learning with Python: Theory and Applications, World Scientific, 2022.
+[21] M. Raissi, Deep hidden physics models: Deep learning of nonlinear partial differential equations, J. Mach. Learn. Res. 19 (25) (2018) 1–24.
+[22] M. Raissi, P. Perdikaris, G.E. Karniadakis, Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving
+nonlinear partial differential equations, J. Comput. Phys. 378 (2019) 686–707.
+[23] S. Cai, Z. Mao, Z. Wang, M. Yin, G.E. Karniadakis, Physics-informed neural networks (PINNs) for fluid mechanics: a review, Acta Mech. Sin. 37 (12)
+(2021) 1727–1738, http://dx.doi.org/10.1007/s10409-021-01148-1 .
+[24] Y. Wang, J. Bai, Z. Lin, Q. Wang, C. Anitescu, J. Sun, M.S. Eshaghi, Y. Gu, X.-Q. Feng, X. Zhuang, et al., Artificial intelligence for partial differential
+equations in computational mechanics: A review, 2024, arXiv preprint arXiv:2410.19843.
+[25] M. Raissi, A. Yazdani, G.E. Karniadakis, Hidden fluid mechanics: Learning velocity and pressure fields from flow visualizations, Science 367 (6481) (2020)
+1026–1030, http://dx.doi.org/10.1126/science.aaw4741, arXiv:https://www.science.org/doi/pdf/10.1126/science.aaw4741 URL https://www.science.org/
+doi/abs/10.1126/science.aaw4741.
+[26] H. Wessels, C. Weißenfels, P. Wriggers, The neural particle method – An updated Lagrangian physics informed neural network for computational fluid
+dynamics, Comput. Methods Appl. Mech. Engrg. 368 (2020) 113127, http://dx.doi.org/10.1016/j.cma.2020.113127, URL https://www.sciencedirect.com/
+science/article/pii/S0045782520303121.
+[27] J. Bai, Y. Zhou, Y. Ma, H. Jeong, H. Zhan, C. Rathnayaka, E. Sauret, Y. Gu, A general neural particle method for hydrodynamics modeling, Comput.
+Methods Appl. Mech. Engrg. 393 (2022) 114740, http://dx.doi.org/10.1016/j.cma.2022.114740, URL https://www.sciencedirect.com/science/article/pii/
+S0045782522000962.
+[28] Z. Li, J. Bai, H. Ouyang, S. Martelli, M. Tang, Y. Yang, H. Wei, P. Liu, R. Wei, Y. Gu, Physics-informed neural networks for friction-involved nonsmooth
+dynamics problems, Nonlinear Dynam. 112 (9) (2024) 7159–7183, http://dx.doi.org/10.1007/s11071-024-09350-z .
+[29] J. Bai, T. Rabczuk, A. Gupta, L. Alzubaidi, Y. Gu, A physics-informed neural network technique based on a modified loss function for computational 2D
+and 3D solid mechanics, Comput. Mech. 71 (3) (2023) 543–562, http://dx.doi.org/10.1007/s00466-022-02252-0 .
+[30] E. Haghighat, M. Raissi, A. Moure, H. Gomez, R. Juanes, A physics-informed deep learning framework for inversion and surrogate modeling in solid
+mechanics, Comput. Methods Appl. Mech. Engrg. 379 (2021) 113741.
+[31] E. Samaniego, C. Anitescu, S. Goswami, V.M. Nguyen-Thanh, H. Guo, K. Hamdia, X. Zhuang, T. Rabczuk, An energy approach to the solution of partial
+differential equations in computational mechanics via machine learning: Concepts, implementation and applications, Comput. Methods Appl. Mech. Engrg.
+362 (2020) 112790.
+[32] Y. Wang, J. Sun, W. Li, Z. Lu, Y. Liu, CENN: Conservative energy method based on neural networks with subdomains for solving variational problems
+involving heterogeneous and complex geometries, Comput. Methods Appl. Mech. Engrg. 400 (2022) 115491, http://dx.doi.org/10.1016/j.cma.2022.115491,
+URL https://www.sciencedirect.com/science/article/pii/S0045782522005096.
+[33] W. Li, M.Z. Bazant, J. Zhu, A physics-guided neural network framework for elastic plates: Comparison of governing equations-based and energy-based
+approaches, Comput. Methods Appl. Mech. Engrg. 383 (2021) 113933, http://dx.doi.org/10.1016/j.cma.2021.113933, URL https://www.sciencedirect.com/
+science/article/pii/S004578252100270X.
+[34] V.M. Nguyen-Thanh, X. Zhuang, T. Rabczuk, A deep energy method for finite deformation hyperelasticity, Eur. J. Mech. A Solids 80 (2020) 103874,
+http://dx.doi.org/10.1016/j.euromechsol.2019.103874, URL https://www.sciencedirect.com/science/article/pii/S0997753819305352.
+[35] S. Niu, E. Zhang, Y. Bazilevs, V. Srivastava, Modeling finite-strain plasticity using physics-informed neural network and assessment of the network
+performance, J. Mech. Phys. Solids 172 (2023) 105177, http://dx.doi.org/10.1016/j.jmps.2022.105177, URL https://www.sciencedirect.com/science/
+article/pii/S0022509622003532.
+[36] J. He, D. Abueidda, R. Abu Al-Rub, S. Koric, I. Jasiuk, A deep learning energy-based method for classical elastoplasticity, Int. J. Plast. 162 (2023) 103531,
+http://dx.doi.org/10.1016/j.ijplas.2023.103531, URL https://www.sciencedirect.com/science/article/pii/S0749641923000177.
+[37] S. Goswami, C. Anitescu, T. Rabczuk, Adaptive phase field analysis with dual hierarchical meshes for brittle fracture, Eng. Fract. Mech. 218 (2019) 106608,
+http://dx.doi.org/10.1016/j.engfracmech.2019.106608, URL https://www.sciencedirect.com/science/article/pii/S0013794419302814.
+[38] S. Goswami, C. Anitescu, S. Chakraborty, T. Rabczuk, Transfer learning enhanced physics informed neural network for phase-field modeling of fracture,
+Theor. Appl. Fract. Mech. 106 (2020) 102447, http://dx.doi.org/10.1016/j.tafmec.2019.102447, URL https://www.sciencedirect.com/science/article/pii/
+S016784421930357X.
+[39] L. Zhao, Q. Shao, DEDEM: Discontinuity embedded deep energy method for solving fracture mechanics problems, 2024, arXiv preprint arXiv:2407.11346.
+[40] J. Bai, G.-R. Liu, T. Rabczuk, Y. Wang, X.-Q. Feng, Y. Gu, A robust radial point interpolation method empowered with neural network solvers (RPIM-
+NNS) for nonlinear solid mechanics, Comput. Methods Appl. Mech. Engrg. 429 (2024) 117159, http://dx.doi.org/10.1016/j.cma.2024.117159, URL
+https://www.sciencedirect.com/science/article/pii/S0045782524004158.
+[41] Z. Zhang, Y. Li, W. Zhou, X. Chen, W. Yao, Y. Zhao, TONR: An exploration for a novel way combining neural network with topology optimization, Comput.
+Methods Appl. Mech. Engrg. 386 (2021) 114083, http://dx.doi.org/10.1016/j.cma.2021.114083, URL https://www.sciencedirect.com/science/article/pii/
+S004578252100414X.
+[42] H. Jeong, J. Bai, C. Batuwatta-Gamage, C. Rathnayaka, Y. Zhou, Y. Gu, A physics-informed neural network-based topology optimization (PINNTO)
+framework for structural optimization, Eng. Struct. 278 (2023) 115484, http://dx.doi.org/10.1016/j.engstruct.2022.115484, URL https://www.sciencedirect.
+com/science/article/pii/S0141029622015607.
+[43] H. Jeong, C. Batuwatta-Gamage, J. Bai, Y.M. Xie, C. Rathnayaka, Y. Zhou, Y. Gu, A complete physics-informed neural network-based framework
+for structural topology optimization, Comput. Methods Appl. Mech. Engrg. 417 (2023) 116401, http://dx.doi.org/10.1016/j.cma.2023.116401, URL
+https://www.sciencedirect.com/science/article/pii/S004578252300525X.
+[44] H. Jeong, C. Batuwatta-Gamage, J. Bai, C. Rathnayaka, Y. Zhou, Y. Gu, An advanced physics-informed neural network-based framework for nonlinear and
+complex topology optimization, Eng. Struct. 322 (2025) 119194.
+[45] K. Tang, X. Wan, C. Yang, DAS-PINNs: A deep adaptive sampling method for solving high-dimensional partial differential equations, J. Comput. Phys. 476
+(2023) 111868.
+[46] Z. Mao, X. Meng, Physics-informed neural networks with residual/gradient-based adaptive sampling methods for solving partial differential equations with
+sharp solutions, Appl. Math. Mech. 44 (7) (2023) 1069–1084.
+[47] Y. Wang, J. Sun, T. Rabczuk, Y. Liu, DCEM: A deep complementary energy method for linear elasticity, Internat. J. Numer. Methods Engrg. (2023) e7585.
+[48] J. Sun, Y. Liu, Y. Wang, Z. Yao, X. Zheng, BINN: A deep learning approach for computational mechanics problems based on boundary integral equations,
+Comput. Methods Appl. Mech. Engrg. 410 (2023) 116012, http://dx.doi.org/10.1016/j.cma.2023.116012, URL https://www.sciencedirect.com/science/
+article/pii/S0045782523001366.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+18 
+
+J. Bai et al.
+[49] Y. Wang, J. Sun, J. Bai, C. Anitescu, M.S. Eshaghi, X. Zhuang, T. Rabczuk, Y. Liu, Kolmogorov Arnold informed neural network: A physics-informed deep
+learning framework for solving PDEs based on Kolmogorov Arnold Networks, 2024, arXiv preprint arXiv:2406.11045.
+[50] T. Sahin, M. von Danwitz, A. Popp, Solving forward and inverse problems of contact mechanics using physics-informed neural networks, Adv. Model.
+Simul. Eng. Sci. 11 (1) (2024) 11, http://dx.doi.org/10.1186/s40323-024-00265-3 .
+[51] Y. Diao, J. Yang, Y. Zhang, D. Zhang, Y. Du, Solving multi-material problems in solid mechanics using physics-informed neural networks based
+on domain decomposition technology, Comput. Methods Appl. Mech. Engrg. 413 (2023) 116120, http://dx.doi.org/10.1016/j.cma.2023.116120, URL
+https://www.sciencedirect.com/science/article/pii/S004578252300244X.
+[52] X. Zhuang, H. Guo, N. Alajlan, H. Zhu, T. Rabczuk, Deep autoencoder based energy method for the bending, vibration, and buckling analysis of
+Kirchhoff plates with transfer learning, Eur. J. Mech. A Solids 87 (2021) 104225, http://dx.doi.org/10.1016/j.euromechsol.2021.104225, URL https:
+//www.sciencedirect.com/science/article/pii/S099775382100019X.
+[53] J. Bai, G.-R. Liu, A. Gupta, L. Alzubaidi, X.-Q. Feng, Y. Gu, Physics-informed radial basis network (PIRBN): A local approximating neural network for
+solving nonlinear partial differential equations, Comput. Methods Appl. Mech. Engrg. 415 (2023) 116290, http://dx.doi.org/10.1016/j.cma.2023.116290,
+URL https://www.sciencedirect.com/science/article/pii/S0045782523004140.
+[54] X.-P. Zhou, K. Feng, MPNN based graph networks as learnable physics engines for deformation and crack propagation in solid mechanics, Int. J. Solids
+Struct. 291 (2024) 112695, http://dx.doi.org/10.1016/j.ijsolstr.2024.112695, URL https://www.sciencedirect.com/science/article/pii/S0020768324000520.
+[55] P.M. Schaefferkoetter, Y.-C. Yoon, J.-H. Song, Three-dimensional continuum point cloud method for large deformation and its verification, Comput.
+Methods Appl. Mech. Engrg. 432 (2024) 117307, http://dx.doi.org/10.1016/j.cma.2024.117307, URL https://www.sciencedirect.com/science/article/pii/
+S0045782524005632.
+[56] T. Zhu, S. Atluri, A modified collocation method and a penalty formulation for enforcing the essential boundary conditions in the element free Galerkin
+method, Comput. Mech. 21 (3) (1998) 211–222.
+[57] G.R. Liu, Y.T. Gu, K.Y. Dai, Assessment and applications of point interpolation methods for computational mechanics, Internat. J. Numer. Methods Engrg.
+59 (10) (2004) 1373–1397, http://dx.doi.org/10.1002/nme.925, arXiv:https://onlinelibrary.wiley.com/doi/pdf/10.1002/nme.925 URL https://onlinelibrary.
+wiley.com/doi/abs/10.1002/nme.925.
+[58] J. Bai, H. Jeong, C.P. Batuwatta-Gamage, S. Xiao, Q. Wang, C. Rathnayaka, L. Alzubaidi, G.-R. Liu, Y. Gu, An introduction to programming physics-informed
+neural network-based computational solid mechanics, Int. J. Comput. Methods 20 (10) (2023) 2350013.
+[59] J.W. Barrett, C.M. Elliott, Finite element approximation of the Dirichlet problem using the boundary penalty method, Numer. Math. 49 (4) (1986) 343–366,
+http://dx.doi.org/10.1007/BF01389536.
+[60] N. Sukumar, A. Srivastava, Exact imposition of boundary conditions with distance functions in physics-informed deep neural networks, Comput.
+Methods Appl. Mech. Engrg. 389 (2022) 114333, http://dx.doi.org/10.1016/j.cma.2021.114333, URL https://www.sciencedirect.com/science/article/pii/
+S0045782521006186.
+[61] D.P. Kingma, Adam: A method for stochastic optimization, 2014, arXiv preprint arXiv:1412.6980.
+[62] J. Fischer, M. Wendland, On the history of key empirical intermolecular potentials, Fluid Phase Equilib. 573 (2023) 113876.
+[63] R.A. Sauer, L. De Lorenzis, A computational contact formulation based on surface potentials, Comput. Methods Appl. Mech. Engrg. 253 (2013) 369–395,
+http://dx.doi.org/10.1016/j.cma.2012.09.002, URL https://www.sciencedirect.com/science/article/pii/S0045782512002769.
+[64] D. Franke, A. Düster, V. Nübel, E. Rank, A comparison of the h-, p-, hp-, and rp-version of the FEM for the solution of the 2D Hertzian contact problem,
+Comput. Mech. 45 (5) (2010) 513–522, http://dx.doi.org/10.1007/s00466-009-0464-6 .
+[65] L. Lu, P. Jin, G. Pang, Z. Zhang, G.E. Karniadakis, Learning nonlinear operators via DeepONet based on the universal approximation theorem of operators,
+Nat. Mach. Intell. 3 (3) (2021) 218–229, http://dx.doi.org/10.1038/s42256-021-00302-5 .
+[66] Z. Li, N. Kovachki, K. Azizzadenesheli, B. Liu, K. Bhattacharya, A. Stuart, A. Anandkumar, Fourier neural operator for parametric partial differential
+equations, 2020, arXiv preprint arXiv:2010.08895.
+[67] Y. Wang, X. Li, Z. Yan, Y. Du, J. Bai, B. Liu, T. Rabczuk, Y. Liu, HomoGenius: a foundation model of homogenization for rapid prediction of effective
+mechanical properties using neural operators, 2024, arXiv preprint arXiv:2404.07943.
+[68] S. Wang, Y. Teng, P. Perdikaris, Understanding and mitigating gradient flow pathologies in physics-informed neural networks, SIAM J. Sci. Comput. 43
+(5) (2021) A3055–A3081, http://dx.doi.org/10.1137/20M1318043, arXiv:https://doi.org/10.1137/20M1318043.
+Computer Methods in Applied Mechanics and Engineering 437 (2025) 117787 
+19 

@@ -1,0 +1,73 @@
+﻿网络架构详细说明（当前版本）
+
+1. 总体结构
+- 输入：空间坐标 X (N,3) + 预紧条件向量 P_hat
+- 条件编码：ParamEncoder 将 P_hat 编码为条件向量 z
+- 场网络：DisplacementNet（GCN 主干）接收 [x_feat, z] 输出位移 u(x; P)
+- 可选应力头：在 h 特征上额外输出 6 维应力（σxx,σyy,σzz,σxy,σyz,σxz）
+- 训练目标：最小势能 Π（E_int + E_cn + E_ct + E_bc + E_tie - W_pre + 其它惩罚项）
+
+2. 预紧条件向量 P_hat（含顺序信息）
+- 归一化：P_hat = (P - preload_shift) / preload_scale
+  - 当前 preload_min=0, preload_max=2000 -> shift=1000, scale=1000
+- 分阶段时的拼接顺序（本版已增强顺序信息）：
+  - P_norm (n_bolts)
+  - stage_mask (n_bolts)
+  - stage_last (n_bolts)
+  - stage_rank (n_bolts)
+  - t_stage (1) = stage_idx/(stage_count-1)
+  - Δt (n_bolts) = max(0, t_stage - tighten_time_i)
+- 以 3 螺栓为例：P_hat 长度 = 3 + 3 + 3 + 3 + 1 + 3 = 16
+- Trainer 会在构建模型前自动推断 P_hat 维度，并同步到 ParamEncoder.in_dim
+
+3. ParamEncoder（条件编码器）
+- 位置：src/model/pinn_model.py::ParamEncoder
+- 结构：MLP
+- 默认配置（无 debug_big_model 覆盖时）：
+  - in_dim：按 P_hat 实际维度自动设置
+  - width=64, depth=2, act=silu, out_dim=64
+- 行为：若 P_hat 维度与配置不一致，会自动 pad/trim 到 in_dim
+
+4. 空间编码（x_feat）
+- 非 DFEM 模式（当前 dfem_mode=false）：
+  - 使用 GaussianFourierFeatures
+  - num=8, sigmas=(1, 10, 50), trainable=false
+  - 输出维度 = 2*num*len(sigmas)+3 = 2*8*3+3 = 51
+- DFEM 模式（dfem_mode=true）时：
+  - 不使用 Fourier；改为每个节点的可训练 embedding
+  - node_emb_dim=64
+
+5. 图网络主干（DisplacementNet）
+- 位置：src/model/pinn_model.py::DisplacementNet
+- 主干：GCN + FiLM 条件调制
+- 关键配置（默认值）：
+  - graph_k=12, graph_layers=4, graph_width=192
+  - graph_dropout=0.0
+  - graph_knn_chunk=1024（kNN 构建分块）
+- GraphConvLayer 内部：
+  - 邻居聚合（mean）
+  - 计算相对坐标统计（rel_mean, rel_std）
+  - 拼接 [feat, agg, rel_feat] -> Dense -> act
+- FiLM 调制：每层有 gamma/beta，初始为恒等（gamma=1, beta=0）
+- 图归一化：LayerNormalization
+
+6. 输出头与尺度
+- 位移输出：graph_out -> (N,3)
+- 输出缩放：output_scale=1e-2（默认不可训练）
+- 应力头：stress_out_dim=6 时启用（当前默认开启）
+- 可选硬约束：hard_bc_radius 若设置可在孔区投影为 0
+
+7. 重要实现细节
+- 条件广播：z 若为 (1,cond_dim) 自动广播到 N 点；否则要求 B=N 或回退 B=1
+- 混合精度：当前默认 fp32（mixed_precision=None）
+- 训练时 u_fn / us_fn 会调用 _normalize_inputs 统一 P_hat / P 输入格式
+
+8. 相关文件索引
+- 网络主体：src/model/pinn_model.py
+- 能量/损失：src/model/loss_energy.py
+- DFEM 内能：src/physics/elasticity_energy.py
+- 接触/摩擦：src/physics/contact/contact_normal_alm.py, src/physics/contact/contact_friction_alm.py
+- 训练流程与条件构建：src/train/trainer.py
+
+备注：如果启用 debug_big_model=true，会额外放大 encoder/field 宽度和深度；默认关闭。
+- ?????step<=300 ? smooth?301-500 ? smooth/strict ???>500 ? strict????1500?????????

@@ -1,0 +1,59 @@
+﻿网络整体架构概览（中文）
+
+1) 总体输入/输出
+- 输入：空间坐标 X (N,3) + 预紧条件向量 P_hat（含顺序/阶段信息）
+- 输出：位移 u(x; P) (N,3)
+- 可选输出：应力头 σ_pred (N,6)
+
+2) 条件编码器 ParamEncoder（P_hat -> z）
+- 结构：MLP（width/depth/act/out_dim 由 config 决定）
+- 作用：将 P_hat 映射为条件向量 z，用于调制位移场
+- 维度：in_dim 由训练前自动推断（根据 P_hat 实际长度）
+- 形状对齐：P_hat 自动 pad/trim 到 in_dim，避免尺寸不一致
+
+3) P_hat 组成（分阶段加载时）
+- P_norm：预紧力归一化向量 (n_bolts)
+- stage_mask：本阶段已拧紧标记 (n_bolts)
+- stage_last：本阶段“当前拧紧”一热向量 (n_bolts)
+- stage_rank：拧紧顺序归一化向量 (n_bolts)
+- t_stage：阶段时间标量 (1) = stage_idx/(stage_count-1)
+- Δt：time-since-tightened 向量 (n_bolts) = max(0, t_stage - tighten_time_i)
+
+4) 空间编码（x -> x_feat）
+- 非 DFEM 模式：Gaussian Fourier Features
+  - 以多个频带 sigma 生成 sin/cos 特征
+  - 输出维度由 fourier.num + fourier.sigmas 决定
+- DFEM 模式：用可训练节点嵌入替代 Fourier（node_embeddings）
+
+5) 位移场主干 DisplacementNet（GCN + FiLM）
+- 输入拼接：h = [x_feat, z_broadcast]
+- GCN 主干：
+  - kNN 邻接（k, chunk size 由 config 决定）
+  - GraphConvLayer 内含邻居聚合 + 相对坐标统计
+  - 多层堆叠（graph_layers, graph_width）
+- FiLM 调制：
+  - 每层根据 z 生成 (gamma, beta)
+  - 初始为恒等（gamma=1, beta=0），训练中逐步学习
+- 归一化：LayerNorm
+
+6) 输出头与尺度
+- 位移头：Dense -> u_out (N,3)
+- 输出尺度：output_scale（默认 1e-2，可选可训练）
+- 应力头：可选 Dense -> σ_pred (N,6)
+
+7) 推理接口
+- u_fn(X, params)：位移场前向
+- us_fn(X, params)：位移 + 应力（若 stress_head 启用）
+- params 可以传 P 或 P_hat，内部统一归一化
+
+8) 与能量训练的关系（摘要）
+- 网络本身只提供位移场/应力场
+- 训练时由 TotalEnergy 组合 DFEM 内能、接触、摩擦、预紧功等，最小化 Π
+- 顺序信息通过 P_hat 进入网络（不依赖显式时间积分）
+
+9) 关键配置位置（供追溯）
+- 网络定义：src/model/pinn_model.py
+- 条件向量构造：src/train/trainer.py::_make_preload_params
+- 训练/能量组装：src/model/loss_energy.py, src/train/trainer.py
+
+备注：若启用 debug_big_model，会放大编码器/主干宽度深度，但默认关闭。
