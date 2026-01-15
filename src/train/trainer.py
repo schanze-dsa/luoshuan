@@ -290,6 +290,9 @@ class Trainer:
         self._last_preload_order: Optional[np.ndarray] = None
         self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
+        self._total_ref: Optional[TotalEnergy] = None
+        self._base_weights: Dict[str, float] = {}
+        self._loss_keys: List[str] = []
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
         self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
@@ -2270,7 +2273,151 @@ class Trainer:
             new_pre = min(eff_max, new_pre)
         state.current["W_pre"] = float(new_pre)
 
-    # 请用此代码完全覆盖 src/train/trainer.py 中的 _train_step 方法
+    # ----------------- tf.function compiled cores -----------------
+
+    def _loss_from_parts_and_weights(
+        self, parts: Dict[str, tf.Tensor], weights: tf.Tensor
+    ) -> tf.Tensor:
+        """Combine scalar parts with a fixed weight vector (order follows self._loss_keys)."""
+        loss = tf.constant(0.0, dtype=tf.float32)
+        for idx, key in enumerate(getattr(self, "_loss_keys", [])):
+            if key not in parts:
+                continue
+            val = parts[key]
+            if not isinstance(val, tf.Tensor):
+                continue
+            if val.shape.rank != 0:
+                continue
+            loss = loss + tf.cast(weights[idx], tf.float32) * tf.cast(val, tf.float32)
+        return loss
+
+    def _build_weight_vector(self) -> tf.Tensor:
+        """Build a weight vector aligned with self._loss_keys (sign applied)."""
+        keys = getattr(self, "_loss_keys", [])
+        if not keys:
+            return tf.zeros((0,), dtype=tf.float32)
+
+        # Choose the source weight dict.
+        if self.loss_state is not None:
+            weight_map = self.loss_state.current
+            sign_map = self.loss_state.sign_overrides
+        else:
+            weight_map = getattr(self, "_base_weights", {})
+            sign_map = None
+
+        if sign_map is None:
+            loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
+            if loss_mode in {"residual", "residual_only", "res"}:
+                sign_map = {"W_pre": 1.0}
+            else:
+                sign_map = {"W_pre": -1.0}
+
+        weights = []
+        for key in keys:
+            w = float(weight_map.get(key, 0.0) or 0.0)
+            sign = float(sign_map.get(key, 1.0)) if sign_map is not None else 1.0
+            weights.append(w * sign)
+        return tf.convert_to_tensor(weights, dtype=tf.float32)
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
+        """Compiled forward+backward for the standard (non-incremental) path."""
+        train_vars = self._train_vars
+        opt = self.optimizer
+        total = self._total_ref
+
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        with tf.GradientTape() as tape:
+            _, parts, stats = total.energy(
+                self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+            )
+            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+            loss_total = loss_no_reg + reg
+
+            use_loss_scale = hasattr(opt, "get_scaled_loss")
+            if use_loss_scale:
+                scaled_loss = opt.get_scaled_loss(loss_total)
+
+        if use_loss_scale:
+            scaled_grads = tape.gradient(scaled_loss, train_vars)
+            grads = opt.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss_total, train_vars)
+
+        return loss_total, loss_no_reg, parts, stats, grads
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_stage_step(
+        self,
+        params: Dict[str, Any],
+        weights: tf.Tensor,
+        locked_deltas: tf.Tensor,
+        use_lock: tf.Tensor,
+    ):
+        """Compiled forward+backward for one incremental stage."""
+        train_vars = self._train_vars
+        opt = self.optimizer
+        total = self._total_ref
+
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        with tf.GradientTape() as tape:
+            _, parts, stats = total.energy(
+                self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+            )
+
+            def _with_lock():
+                preload_stats = stats.get("preload") or stats.get("preload_stats")
+                stage_mask = params.get("stage_mask")
+                stage_last = params.get("stage_last")
+                if (
+                    isinstance(preload_stats, Mapping)
+                    and preload_stats.get("bolt_deltas") is not None
+                    and stage_mask is not None
+                    and stage_last is not None
+                ):
+                    bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
+                    lock_mask = tf.clip_by_value(
+                        tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
+                    )
+                    res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
+                    parts["E_lock"] = tf.reduce_sum(res * res)
+                else:
+                    parts["E_lock"] = tf.cast(0.0, tf.float32)
+
+            def _no_lock():
+                parts["E_lock"] = tf.cast(0.0, tf.float32)
+
+            tf.cond(use_lock, _with_lock, _no_lock)
+
+            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+            loss_total = loss_no_reg + reg
+
+            use_loss_scale = hasattr(opt, "get_scaled_loss")
+            if use_loss_scale:
+                scaled_loss = opt.get_scaled_loss(loss_total)
+
+        if use_loss_scale:
+            scaled_grads = tape.gradient(scaled_loss, train_vars)
+            grads = opt.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss_total, train_vars)
+
+        return loss_total, loss_no_reg, parts, stats, grads
+
     def _train_step(
         self,
         total,
@@ -2280,33 +2427,28 @@ class Trainer:
     ):
         if bool(getattr(self.cfg, "incremental_mode", False)):
             return self._train_step_incremental(total, preload_case, step=step)
-        model = self.model
         opt = self.optimizer
-        train_vars = self._collect_trainable_variables()
+        train_vars = self._train_vars or self._collect_trainable_variables()
+        if self._total_ref is None:
+            self._total_ref = total
 
         # 1. 生成完整参数 (包含 stages 字典)
         params = self._make_preload_params(preload_case)
 
-        # 保持完整的阶段序列传入 total.energy，这样弹性/接触/预紧都会按 tighten 顺序逐
-        # 阶段累积，不再随机抽取单一阶段，避免顺序信息被丢弃。
+        weight_vec = self._build_weight_vector()
+        loss, loss_no_reg, parts, stats, grads = self._compiled_step(params, weight_vec)
 
-        with tf.GradientTape() as tape:
-            # params 中保留了阶段序列（含 P_hat/顺序特征），总能量会按顺序累加
-            loss, Pi, parts, stats = self._compute_total_loss(total, params, adaptive=True)
+        if self.loss_state is not None:
+            update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
+            Pi = combine_loss(parts, self.loss_state)
+        else:
+            Pi = loss_no_reg
 
-            use_loss_scale = hasattr(opt, "get_scaled_loss")
-            if use_loss_scale:
-                scaled_loss = opt.get_scaled_loss(loss)
-
-        # 4) 反传 & 梯度缩放
+        # 4) 反传 & 梯度裁剪
         step_txt = "" if step is None else f" step={step}"
         loss_val = float(tf.cast(loss, tf.float32).numpy())
         loss_finite = bool(np.isfinite(loss_val))
-        if use_loss_scale:
-            scaled_grads = tape.gradient(scaled_loss, train_vars)
-            grads = opt.get_unscaled_gradients(scaled_grads)
-        else:
-            grads = tape.gradient(loss, train_vars)
 
         if not any(g is not None for g in grads):
             raise RuntimeError(
@@ -2355,9 +2497,10 @@ class Trainer:
         step: Optional[int] = None,
     ):
         """Incremental Mode A: solve stages sequentially with per-stage updates."""
-        model = self.model
         opt = self.optimizer
-        train_vars = self._collect_trainable_variables()
+        train_vars = self._train_vars or self._collect_trainable_variables()
+        if self._total_ref is None:
+            self._total_ref = total
 
         params_full = self._make_preload_params(preload_case)
         stage_count = self._get_stage_count(params_full)
@@ -2416,23 +2559,29 @@ class Trainer:
                 )
 
             for _ in range(stage_inner_steps):
-                with tf.GradientTape() as tape:
-                    loss, Pi, parts, stats = self._compute_total_loss_incremental(
-                        total,
-                        stage_params,
-                        locked_deltas=locked_deltas,
-                        force_then_lock=force_then_lock,
-                        adaptive=True,
+                weight_vec = self._build_weight_vector()
+                if locked_deltas is None:
+                    locked_deltas_tensor = tf.zeros_like(
+                        tf.convert_to_tensor(stage_params.get("P"), dtype=tf.float32)
                     )
-                    use_loss_scale = hasattr(opt, "get_scaled_loss")
-                    if use_loss_scale:
-                        scaled_loss = opt.get_scaled_loss(loss)
-
-                if use_loss_scale:
-                    scaled_grads = tape.gradient(scaled_loss, train_vars)
-                    grads = opt.get_unscaled_gradients(scaled_grads)
+                    use_lock = False
                 else:
-                    grads = tape.gradient(loss, train_vars)
+                    locked_deltas_tensor = tf.cast(locked_deltas, tf.float32)
+                    use_lock = bool(force_then_lock)
+
+                loss, loss_no_reg, parts, stats, grads = self._compiled_stage_step(
+                    stage_params,
+                    weight_vec,
+                    locked_deltas_tensor,
+                    tf.constant(use_lock),
+                )
+
+                if self.loss_state is not None:
+                    update_loss_weights(self.loss_state, parts, stats)
+                    self._tie_preload_weight_to_internal()
+                    Pi = combine_loss(parts, self.loss_state)
+                else:
+                    Pi = loss_no_reg
 
                 if not any(g is not None for g in grads):
                     raise RuntimeError(
@@ -2674,6 +2823,7 @@ class Trainer:
             cfg=self.cfg,
         )
         print("[dbg] Tie/BC 已挂载到 total")
+        self._total_ref = total
 
         # ---- 初始化自适应损失权重状态 ----
         # 以 TotalConfig 里的 w_int / w_cn / ... 作为基准权重
@@ -2694,6 +2844,8 @@ class Trainer:
             "R_fric_comp": 0.0,
             "R_contact_comp": 0.0,
         }
+        self._base_weights = base_weights
+        self._loss_keys = list(base_weights.keys())
 
         adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
         loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
