@@ -73,7 +73,6 @@ class TotalConfig:
     w_eq: float = 0.0            # equilibrium residual term (div σ_pred ≈ 0)
     w_reg: float = 0.0           # regularization term (residual-only mode)
     # 参考应力尺度，用于将 E_sigma 归一化为无量纲（例如取材料屈服强度 MPa）
-    w_lock: float = 0.0          # staged preload: lock previously tightened bolts (force-then-lock)
     sigma_ref: float = 1.0
 
     # staged preload 路径惩罚权重（增量势能中对加载顺序敏感）
@@ -146,8 +145,6 @@ class TotalEnergy:
             self.w_eq = tf.Variable(self.cfg.w_eq, dtype=self.dtype, trainable=False, name="w_eq")
         if not hasattr(self, "w_reg"):
             self.w_reg = tf.Variable(self.cfg.w_reg, dtype=self.dtype, trainable=False, name="w_reg")
-        if not hasattr(self, "w_lock"):
-            self.w_lock = tf.Variable(self.cfg.w_lock, dtype=self.dtype, trainable=False, name="w_lock")
 
     def _loss_mode(self) -> str:
         mode = str(getattr(self.cfg, "loss_mode", "energy") or "energy").strip().lower()
@@ -292,8 +289,8 @@ class TotalEnergy:
             if "R_contact_comp" in stats_cn:
                 parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
 
-        # Tie constraints (skip if config weight is effectively zero)
-        if self.ties and abs(float(getattr(self.cfg, "w_tie", 0.0))) > 1e-15:
+        # Tie constraints (always compute if present; weight can be zero at runtime)
+        if self.ties:
             tie_terms = []
             for tie in self.ties:
                 et, tstat = tie.energy(u_fn, params)
@@ -312,8 +309,8 @@ class TotalEnergy:
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
 
-        # Preload work (skip if config weight is effectively zero)
-        if self.preload is not None and abs(float(getattr(self.cfg, "w_pre", 0.0))) > 1e-15:
+        # Preload work (always compute if present; weight can be zero at runtime)
+        if self.preload is not None:
             W_pre, pstats = self.preload.energy(u_fn, params, u_nodes=u_nodes)
             parts["W_pre"] = tf.cast(W_pre, dtype)
             # 同时暴露两种键：
@@ -463,7 +460,6 @@ class TotalEnergy:
             "W_pre": zero,
             "E_sigma": zero,
             "E_eq": zero,
-            "E_lock": zero,
             "E_reg": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
@@ -499,7 +495,7 @@ class TotalEnergy:
             if "R_contact_comp" in stats_cn:
                 parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
 
-        if self.ties and abs(float(getattr(self.cfg, "w_tie", 0.0))) > 1e-15:
+        if self.ties:
             tie_terms = []
             for tie in self.ties:
                 lt, tstat = tie.residual(u_fn, params)
@@ -518,7 +514,7 @@ class TotalEnergy:
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
 
-        if self.preload is not None and abs(float(getattr(self.cfg, "w_pre", 0.0))) > 1e-15:
+        if self.preload is not None:
             L_pre, pstats = self.preload.residual(
                 u_fn, params, u_nodes=u_nodes, stress_fn=stress_fn
             )
@@ -663,7 +659,6 @@ class TotalEnergy:
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
             + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
             + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
-            + self.w_lock * parts.get("E_lock", tf.cast(0.0, self.dtype))
         )
 
     def _combine_parts_without_preload(self, parts: Dict[str, tf.Tensor]) -> tf.Tensor:
@@ -678,7 +673,6 @@ class TotalEnergy:
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
             + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
             + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
-            + self.w_lock * parts.get("E_lock", tf.cast(0.0, self.dtype))
         )
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
@@ -690,7 +684,7 @@ class TotalEnergy:
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma", "E_eq", "E_lock"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma", "E_eq"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -751,7 +745,6 @@ class TotalEnergy:
         prev_slip: Optional[tf.Tensor] = None
         prev_W_pre = tf.cast(0.0, dtype)
         last_preload_entry: Optional[dict] = None
-        locked_deltas: Optional[tf.Tensor] = None
 
         stage_count = len(stage_seq)
 
@@ -795,26 +788,7 @@ class TotalEnergy:
                     bolt_deltas = tf.cast(bd, dtype)
                     last_preload_entry = pre_entry
 
-            # Force-then-lock: lock the axial deltas of previously tightened bolts.
-            if force_then_lock and bolt_deltas is not None:
-                stage_mask = stage_params.get("stage_mask")
-                stage_last = stage_params.get("stage_last")
-                if stage_mask is not None and stage_last is not None:
-                    if locked_deltas is None:
-                        locked_deltas = tf.zeros_like(tf.cast(bolt_deltas, dtype))
-                    lock_mask = tf.clip_by_value(
-                        tf.cast(stage_mask, dtype) - tf.cast(stage_last, dtype),
-                        0.0,
-                        1.0,
-                    )
-                    res = (tf.cast(bolt_deltas, dtype) - locked_deltas) * lock_mask
-                    stage_parts["E_lock"] = tf.reduce_sum(res * res)
-                    last_vec = tf.cast(stage_last, dtype)
-                    locked_deltas = (
-                        last_vec * tf.stop_gradient(tf.cast(bolt_deltas, dtype))
-                        + (1.0 - last_vec) * locked_deltas
-                    )
-            stage_parts.setdefault("E_lock", tf.cast(0.0, dtype))
+            # No lock penalty: earlier bolts are free to relax.
 
             W_stage = tf.cast(stage_parts.get("W_pre", tf.cast(0.0, dtype)), dtype)
             if force_then_lock and "P_cumulative" in stage_params:
@@ -932,7 +906,6 @@ class TotalEnergy:
             "W_pre",
             "E_sigma",
             "E_eq",
-            "E_lock",
             "E_reg",
         ]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
@@ -994,7 +967,6 @@ class TotalEnergy:
         prev_P: Optional[tf.Tensor] = None
         prev_slip: Optional[tf.Tensor] = None
         last_preload_entry: Optional[dict] = None
-        locked_deltas: Optional[tf.Tensor] = None
 
         stage_count = len(stage_seq)
 
@@ -1035,25 +1007,7 @@ class TotalEnergy:
                     bolt_deltas = tf.cast(bd, dtype)
                     last_preload_entry = pre_entry
 
-            if force_then_lock and bolt_deltas is not None:
-                stage_mask = stage_params.get("stage_mask")
-                stage_last = stage_params.get("stage_last")
-                if stage_mask is not None and stage_last is not None:
-                    if locked_deltas is None:
-                        locked_deltas = tf.zeros_like(tf.cast(bolt_deltas, dtype))
-                    lock_mask = tf.clip_by_value(
-                        tf.cast(stage_mask, dtype) - tf.cast(stage_last, dtype),
-                        0.0,
-                        1.0,
-                    )
-                    res = (tf.cast(bolt_deltas, dtype) - locked_deltas) * lock_mask
-                    stage_parts["E_lock"] = tf.reduce_sum(res * res)
-                    last_vec = tf.cast(stage_last, dtype)
-                    locked_deltas = (
-                        last_vec * tf.stop_gradient(tf.cast(bolt_deltas, dtype))
-                        + (1.0 - last_vec) * locked_deltas
-                    )
-            stage_parts.setdefault("E_lock", tf.cast(0.0, dtype))
+            # No lock penalty: earlier bolts are free to relax.
 
             for key in keys:
                 cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)

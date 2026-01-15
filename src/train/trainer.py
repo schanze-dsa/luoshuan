@@ -592,7 +592,6 @@ class Trainer:
             "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
             "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
             "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
-            "E_lock": getattr(self.cfg.total_cfg, "w_lock", 0.0),
         }
         if self.loss_state is not None:
             for key, value in self.loss_state.current.items():
@@ -626,7 +625,6 @@ class Trainer:
             ("E_tie", "Etie"),
             ("E_bc", "Ebc"),
             ("W_pre", "Wpre"),
-            ("E_lock", "Elock"),
             ("E_sigma", "Esig"),
             ("E_eq", "Eeq"),
         ]
@@ -2186,28 +2184,7 @@ class Trainer:
             self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
         )
 
-        # Optional lock penalty for force_then_lock
-        E_lock = None
-        if force_then_lock and locked_deltas is not None:
-            preload_stats = stats.get("preload") or stats.get("preload_stats")
-            stage_mask = params.get("stage_mask")
-            stage_last = params.get("stage_last")
-            if (
-                isinstance(preload_stats, Mapping)
-                and preload_stats.get("bolt_deltas") is not None
-                and stage_mask is not None
-                and stage_last is not None
-            ):
-                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
-                lock_mask = tf.clip_by_value(
-                    tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
-                )
-                res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
-                E_lock = tf.reduce_sum(res * res)
-                parts["E_lock"] = E_lock
-
-        if E_lock is None and "E_lock" not in parts:
-            parts["E_lock"] = tf.cast(0.0, tf.float32)
+        # No lock penalty: earlier bolts are free to relax.
 
         Pi = total._combine_parts(parts)
         if self.loss_state is not None:
@@ -2358,8 +2335,6 @@ class Trainer:
         self,
         params: Dict[str, Any],
         weights: tf.Tensor,
-        locked_deltas: tf.Tensor,
-        use_lock: tf.Tensor,
     ):
         """Compiled forward+backward for one incremental stage."""
         train_vars = self._train_vars
@@ -2377,24 +2352,7 @@ class Trainer:
             _, parts, stats = total.energy(
                 self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
             )
-            preload_stats = stats.get("preload") or stats.get("preload_stats")
-            stage_mask = params.get("stage_mask")
-            stage_last = params.get("stage_last")
-            E_lock = tf.cast(0.0, tf.float32)
-            if (
-                isinstance(preload_stats, Mapping)
-                and preload_stats.get("bolt_deltas") is not None
-                and stage_mask is not None
-                and stage_last is not None
-            ):
-                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
-                lock_mask = tf.clip_by_value(
-                    tf.cast(stage_mask, tf.float32) - tf.cast(stage_last, tf.float32), 0.0, 1.0
-                )
-                res = (bolt_deltas - tf.cast(locked_deltas, tf.float32)) * lock_mask
-                E_lock = tf.reduce_sum(res * res)
-            E_lock = tf.cast(use_lock, tf.float32) * E_lock
-            parts["E_lock"] = E_lock
+            # No lock penalty: earlier bolts are free to relax.
 
             loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
             reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
@@ -2507,7 +2465,6 @@ class Trainer:
         if self.contact is not None and self.cfg.reset_contact_state_per_case:
             self.contact.reset_multipliers(reset_reference=True)
 
-        locked_deltas: Optional[tf.Tensor] = None
         stage_inner_steps = max(1, int(getattr(self.cfg, "stage_inner_steps", 1)))
         stage_alm_every = max(1, int(getattr(self.cfg, "stage_alm_every", 1)))
         use_delta_st = bool(getattr(self.contact.friction.cfg, "use_delta_st", False)) if self.contact else False
@@ -2554,20 +2511,9 @@ class Trainer:
 
             for _ in range(stage_inner_steps):
                 weight_vec = self._build_weight_vector()
-                if locked_deltas is None:
-                    locked_deltas_tensor = tf.zeros_like(
-                        tf.convert_to_tensor(stage_params.get("P"), dtype=tf.float32)
-                    )
-                    use_lock = False
-                else:
-                    locked_deltas_tensor = tf.cast(locked_deltas, tf.float32)
-                    use_lock = bool(force_then_lock)
-
                 loss, loss_no_reg, parts, stats, grads = self._compiled_stage_step(
                     stage_params,
                     weight_vec,
-                    locked_deltas_tensor,
-                    tf.constant(use_lock),
                 )
 
                 if self.loss_state is not None:
@@ -2614,24 +2560,6 @@ class Trainer:
             # Stage ALM update (once per stage by default)
             if stage_alm_every > 0 and ((stage_idx + 1) % stage_alm_every == 0):
                 total.update_multipliers(self.model.u_fn, params=stage_params)
-
-            # Update locked deltas for force-then-lock
-            preload_stats = stats.get("preload") or stats.get("preload_stats")
-            stage_last = stage_params.get("stage_last")
-            if (
-                force_then_lock
-                and stage_last is not None
-                and isinstance(preload_stats, Mapping)
-                and preload_stats.get("bolt_deltas") is not None
-            ):
-                bolt_deltas = tf.cast(preload_stats.get("bolt_deltas"), tf.float32)
-                if locked_deltas is None:
-                    locked_deltas = tf.zeros_like(bolt_deltas)
-                last_vec = tf.cast(stage_last, tf.float32)
-                locked_deltas = (
-                    last_vec * tf.stop_gradient(bolt_deltas)
-                    + (1.0 - last_vec) * locked_deltas
-                )
 
             # Commit friction reference for delta slip between stages
             if use_delta_st and self.contact is not None:
@@ -2831,7 +2759,6 @@ class Trainer:
             "E_sigma": self.cfg.total_cfg.w_sigma,
             "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
             "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
-            "E_lock": getattr(self.cfg.total_cfg, "w_lock", 0.0),
             "path_penalty_total": getattr(self.cfg.total_cfg, "path_penalty_weight", 0.0),
             "fric_path_penalty_total": getattr(self.cfg.total_cfg, "fric_path_penalty_weight", 0.0),
             # 残差项默认权重为 0，需要的话再在 config 里改

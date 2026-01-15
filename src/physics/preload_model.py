@@ -604,6 +604,24 @@ class PreloadWork:
                     scale = tf.ones_like(rank_vec)
                 P = P * scale
 
+        stage_last = params.get("stage_last", None)
+        if stage_last is not None:
+            last_vec = tf.convert_to_tensor(stage_last, dtype=tf.float32)
+            last_len = tf.shape(last_vec)[0]
+
+            def _pad_last():
+                pad = nb_tf - last_len
+                zeros = tf.zeros((pad,), dtype=tf.float32)
+                return tf.concat([last_vec, zeros], axis=0)
+
+            def _truncate_last():
+                return last_vec[:nb]
+
+            last_vec = tf.cond(last_len < nb_tf, _pad_last, _truncate_last)
+            last_vec = last_vec[:nb]
+        else:
+            last_vec = tf.ones((nb,), dtype=tf.float32)
+
         # Always compute bolt_deltas for force-then-lock usage.
         deltas = []
         for bolt in self._bolts:
@@ -611,6 +629,8 @@ class PreloadWork:
             deltas.append(di)
         delta_vec = tf.stack(deltas, axis=0)
         stats = {"preload": {"bolt_deltas": delta_vec}}
+        if stage_last is not None:
+            stats["preload"]["stage_last"] = last_vec
 
         if stress_fn is None:
             if self.cfg.warn_on_missing_stress or self.cfg.error_on_missing_stress:
@@ -642,8 +662,11 @@ class PreloadWork:
         force_vec = tf.stack(forces, axis=0)
         stats["preload"]["bolt_forces"] = force_vec
 
-        P_ref = tf.maximum(tf.reduce_max(tf.abs(P[:nb])), tf.constant(1.0, dtype=tf.float32))
+        active_P = tf.cast(P[:nb], tf.float32) * tf.cast(last_vec, tf.float32)
+        P_ref = tf.maximum(tf.reduce_max(tf.abs(active_P)), tf.constant(1.0, dtype=tf.float32))
         r_pre = (force_vec - tf.cast(P[:nb], tf.float32)) / P_ref
-        L_pre = tf.reduce_mean(r_pre * r_pre)
+        r_pre = r_pre * tf.cast(last_vec, tf.float32)
+        denom = tf.reduce_sum(tf.cast(last_vec, tf.float32)) + tf.constant(1e-12, dtype=tf.float32)
+        L_pre = tf.reduce_sum(r_pre * r_pre) / denom
         stats["preload"]["preload_rms"] = tf.sqrt(tf.reduce_mean(r_pre * r_pre) + 1e-12)
         return L_pre, stats

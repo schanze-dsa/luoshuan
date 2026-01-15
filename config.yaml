@@ -208,6 +208,8 @@ network_config:
   node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
   graph_precompute: true   # 预计算全局 kNN 邻接并缓存
   graph_k: 8               # kNN 邻居数（提速用；固体力学通常够用）
+  graph_width: 128         # GCN 隐藏维度（提速）
+  graph_layers: 3          # GCN 层数（提速）
 
   layers:
     - 64
@@ -220,7 +222,7 @@ network_config:
 # 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
 mirror_surface_name: 'MIRROR up'
 
-mixed_precision: "mixed_float16"          # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
+mixed_precision: null                     # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
 
 optimizer_config:
   type: Adam
@@ -282,7 +284,6 @@ loss_config:
 
     w_reg: 1.0e-4
 
-    w_lock: 5.0e-2     # staged preload: lock penalty (force_then_lock) - 强化“锁长+卸载”路径依赖
   adaptive:
     # 暂时开启，但必须限制范围！防止它自动把 w_ct 调回 9.0 这种危险值
     enabled: true
@@ -355,7 +356,7 @@ resample_contact_every: 50  # 每隔多少步重采样接触点（0=只采样首
 alm_update_every: 0                # 交由阶段内 ALM 更新
 
 incremental_mode: true
-stage_inner_steps: 5
+stage_inner_steps: 1
 stage_alm_every: 1
 stage_resample_contact: true
 reset_contact_state_per_case: true

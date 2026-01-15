@@ -425,7 +425,6 @@ def _prepare_config_with_autoguess():
         "w_sigma": ("w_sigma", "E_sigma"),
         "w_eq": ("w_eq", "E_eq"),
         "w_reg": ("w_reg", "E_reg"),
-        "w_lock": ("w_lock", "E_lock"),
         "w_path": ("path_penalty_weight", "path_penalty_total"),
         "w_fric_path": ("fric_path_penalty_weight", "fric_path_penalty_total"),
     }
@@ -447,6 +446,12 @@ def _prepare_config_with_autoguess():
     if "graph_k" in net_cfg_yaml:
         cfg.model_cfg.field.graph_k = int(net_cfg_yaml["graph_k"])
         print(f"[main] Graph k: {cfg.model_cfg.field.graph_k}")
+    if "graph_width" in net_cfg_yaml:
+        cfg.model_cfg.field.graph_width = int(net_cfg_yaml["graph_width"])
+        print(f"[main] Graph width: {cfg.model_cfg.field.graph_width}")
+    if "graph_layers" in net_cfg_yaml:
+        cfg.model_cfg.field.graph_layers = int(net_cfg_yaml["graph_layers"])
+        print(f"[main] Graph layers: {cfg.model_cfg.field.graph_layers}")
 
     # ===== 接触力学参数（normal/friction）=====
     normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
