@@ -53,6 +53,7 @@ from physics.contact.contact_operator import ContactOperator, ContactOperatorCon
 from physics.tie_constraints import TiePenalty, TieConfig
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
 from physics.preload_model import PreloadWork, PreloadConfig
+from physics.tightening_model import NutTighteningPenalty, TighteningConfig
 
 
 # -----------------------------
@@ -69,6 +70,7 @@ class TotalConfig:
     w_tie: float = 1.0
     w_bc: float = 1.0            # boundary penalty -> E_bc
     w_pre: float = 1.0           # multiplies the subtracted W_pre
+    w_tight: float = 1.0         # nut tightening rotation penalty
     w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
     w_eq: float = 0.0            # equilibrium residual term (div σ_pred ≈ 0)
     w_reg: float = 0.0           # regularization term (residual-only mode)
@@ -118,6 +120,7 @@ class TotalEnergy:
         self.ties: List[TiePenalty] = []
         self.bcs: List[BoundaryPenalty] = []
         self.preload: Optional[PreloadWork] = None
+        self.tightening: Optional[NutTighteningPenalty] = None
 
         # trainable (non) scalars as TF vars so they can be scheduled
         self._ensure_weight_vars()
@@ -139,6 +142,8 @@ class TotalEnergy:
             self.w_bc = tf.Variable(self.cfg.w_bc, dtype=self.dtype, trainable=False, name="w_bc")
         if not hasattr(self, "w_pre"):
             self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
+        if not hasattr(self, "w_tight"):
+            self.w_tight = tf.Variable(self.cfg.w_tight, dtype=self.dtype, trainable=False, name="w_tight")
         if not hasattr(self, "w_sigma"):
             self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
         if not hasattr(self, "w_eq"):
@@ -159,6 +164,7 @@ class TotalEnergy:
         elasticity: Optional[ElasticityEnergy] = None,
         contact: Optional[ContactOperator] = None,
         preload: Optional[PreloadWork] = None,
+        tightening: Optional[NutTighteningPenalty] = None,
         ties: Optional[List[TiePenalty]] = None,
         bcs: Optional[List[BoundaryPenalty]] = None,
     ):
@@ -171,6 +177,8 @@ class TotalEnergy:
             self.contact = contact
         if preload is not None:
             self.preload = preload
+        if tightening is not None:
+            self.tightening = tightening
         if ties is not None:
             self.ties = list(ties)
         if bcs is not None:
@@ -183,6 +191,7 @@ class TotalEnergy:
         self.elasticity = None
         self.contact = None
         self.preload = None
+        self.tightening = None
         self.ties = []
         self.bcs = []
         self._built = False
@@ -246,6 +255,7 @@ class TotalEnergy:
             "E_tie": zero,
             "E_bc": zero,
             "W_pre": zero,
+            "E_tight": zero,
             "E_sigma": zero,
             "E_eq": zero,
         }
@@ -318,6 +328,11 @@ class TotalEnergy:
             # - stats["pre_preload"]：兼容 staged preload 的历史逻辑
             stats.update(pstats)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})
+
+        if self.tightening is not None:
+            E_tight, tstats = self.tightening.energy(u_fn, params, u_nodes=u_nodes)
+            parts["E_tight"] = tf.cast(E_tight, dtype)
+            stats.update(tstats)
 
         # 应力监督 / 平衡残差：需要应力头与弹性算子缓存
         w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
@@ -458,6 +473,7 @@ class TotalEnergy:
             "E_tie": zero,
             "E_bc": zero,
             "W_pre": zero,
+            "E_tight": zero,
             "E_sigma": zero,
             "E_eq": zero,
             "E_reg": zero,
@@ -521,6 +537,11 @@ class TotalEnergy:
             parts["W_pre"] = tf.cast(L_pre, dtype)
             stats.update(pstats)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})
+
+        if self.tightening is not None:
+            E_tight, tstats = self.tightening.residual(u_fn, params, u_nodes=u_nodes)
+            parts["E_tight"] = tf.cast(E_tight, dtype)
+            stats.update(tstats)
 
         w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
         w_eq = float(getattr(self.cfg, "w_eq", 0.0))
@@ -656,6 +677,7 @@ class TotalEnergy:
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
             + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             + pre_sign * self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
+            + self.w_tight * parts.get("E_tight", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
             + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
             + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
@@ -670,6 +692,7 @@ class TotalEnergy:
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
             + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
+            + self.w_tight * parts.get("E_tight", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
             + self.w_eq * parts.get("E_eq", tf.cast(0.0, self.dtype))
             + self.w_reg * parts.get("E_reg", tf.cast(0.0, self.dtype))
@@ -684,7 +707,7 @@ class TotalEnergy:
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma", "E_eq"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_tight", "E_sigma", "E_eq"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -904,6 +927,7 @@ class TotalEnergy:
             "E_tie",
             "E_bc",
             "W_pre",
+            "E_tight",
             "E_sigma",
             "E_eq",
             "E_reg",

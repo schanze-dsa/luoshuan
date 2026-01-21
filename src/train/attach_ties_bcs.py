@@ -439,10 +439,36 @@ def _extract_ties_from_asm(asm) -> List[Dict[str, Any]]:
 
 def _parse_boundary_entry(raw_entry: Any) -> Dict[str, Any]:
     raw = getattr(raw_entry, "raw", raw_entry)
-    row = [t.strip() for t in str(raw).split(",") if t.strip()]
+    text = str(raw).strip()
+    row = [t.strip() for t in text.split(",") if t.strip()]
     setn = row[0] if row else ""
     typ = "BOUNDARY"
     d1 = d2 = None
+
+    # ANSYS D constraints: D, node_id, DOF, value
+    if row and row[0].upper() == "D":
+        def _to_int(x):
+            try:
+                return int(float(x))
+            except Exception:
+                return None
+
+        def _dof_from_label(label: str) -> Optional[int]:
+            lab = (label or "").strip().upper()
+            if lab in {"UX", "X", "U1"}:
+                return 1
+            if lab in {"UY", "Y", "U2"}:
+                return 2
+            if lab in {"UZ", "Z", "U3"}:
+                return 3
+            if lab in {"ROTX", "ROTY", "ROTZ"}:
+                return {"ROTX": 4, "ROTY": 5, "ROTZ": 6}.get(lab)
+            return None
+
+        node_id = _to_int(row[1]) if len(row) >= 2 else None
+        dof = _dof_from_label(row[2]) if len(row) >= 3 else None
+        if node_id is not None and dof is not None:
+            return {"node": node_id, "type": typ, "dof1": dof, "dof2": dof, "raw": raw}
 
     if len(row) >= 2 and row[1].upper().startswith("ENCASTRE"):
         typ = "ENCASTRE"
@@ -482,12 +508,29 @@ def _boundary_mask(d1: Optional[int], d2: Optional[int], kind: str, N: int) -> n
 
 
 def _extract_bcs_from_asm(asm) -> List[Dict[str, Any]]:
-    """抽取已解析的边界条件，兼容 asm.boundaries / asm.bcs。"""
+    """???????????????????????????????????????asm.boundaries / asm.bcs???"""
     bcs_cfg: List[Dict[str, Any]] = []
+    d_nodes: Dict[int, Set[int]] = {}
     for b in (getattr(asm, "boundaries", None) or getattr(asm, "bcs", []) or []):
-        bcs_cfg.append(_parse_boundary_entry(b))
-    return bcs_cfg
+        entry = _parse_boundary_entry(b)
+        if "node" in entry:
+            dof = entry.get("dof1")
+            node_id = entry.get("node")
+            if dof is None or node_id is None:
+                continue
+            d_nodes.setdefault(int(dof), set()).add(int(node_id))
+            continue
+        bcs_cfg.append(entry)
 
+    # Group ANSYS D constraints by DOF so we can apply one mask per DOF.
+    for dof, nodes in sorted(d_nodes.items()):
+        if dof > 3:
+            # Ignore rotational DOFs for displacement-only BCs.
+            continue
+        bcs_cfg.append(
+            {"nodes": sorted(nodes), "type": "BOUNDARY", "dof1": dof, "dof2": dof, "raw": f"D,DOF={dof}"}
+        )
+    return bcs_cfg
 
 def build_surface_correspondence(asm, slave_key: str, master_key: str, n_points: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -643,15 +686,22 @@ def attach_ties_and_bcs_from_inp(total, asm, cfg) -> None:
         d1 = b.get("dof1")
         d2 = b.get("dof2") if b.get("dof2") is not None else d1
 
-        X, w = get_nset_coords(asm, setn)
+        nodes = b.get("nodes")
+        if nodes:
+            X = _coords_for_node_ids(asm, nodes)
+            w = np.ones((X.shape[0],), dtype=np.float32)
+        else:
+            X, w = get_nset_coords(asm, setn)
         if isinstance(X, (list, tuple, np.ndarray, dict)):
-            X = _as_array3(X) if len(np.asarray(X).shape) != 0 else X  # ★ 兜底
+            X = _as_array3(X) if len(np.asarray(X).shape) != 0 else X  # ?????????
 
         if BoundaryPenalty is not None and isinstance(X, np.ndarray) and X.shape[0] > 0:
             try:
                 bc_cfg = BoundaryConfig(alpha=bc_alpha, mode=bc_mode, mu=bc_mu)
                 bc = BoundaryPenalty(cfg=bc_cfg)
                 mask = _boundary_mask(d1, d2, typ, X.shape[0])
+                if not np.any(mask):
+                    continue
                 bc.build_from_numpy(X, mask, u_target=None, w_bc=w)
                 bcs_out.append(bc)
                 continue

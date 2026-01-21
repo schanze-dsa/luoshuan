@@ -11,7 +11,7 @@ One-click runner for your DFEM/PINN project (PyCharm 直接运行即可).
 - 与新版 surfaces.py / inp_parser.py 对齐（ELEMENT 表面可直接采样）
 - 训练配置集中覆盖（降显存：节点前向分块、降低采样规模、混合精度）
 - 训练配置由 config.yaml 驱动（未找到或缺失必填项会直接报错）
-- 训练结束后在 outputs/ 生成随机 5 组镜面变形云图（文件名含三螺栓预紧力）
+- 训练结束后在 outputs/ 生成随机 5 组镜面变形云图（文件名含螺母拧紧角度）
 """
 
 # ====== 必须在导入 TensorFlow 之前设置 ======
@@ -111,6 +111,7 @@ def _default_saved_model_dir(out_dir: str) -> str:
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
 from inp_io.inp_parser import load_inp
+from inp_io.cdb_parser import load_cdb
 from mesh.contact_pairs import guess_surface_key
 
 
@@ -154,13 +155,21 @@ def _prepare_config_with_autoguess():
     # 0) 读取 config.yaml（若存在）
     cfg_yaml = _load_yaml_config()
 
-    # 1) INP 路径
-    inp_path = cfg_yaml.get("inp_path", "").strip()
+    # 1) 模型路径 (inp / cdb)
+    inp_path = (
+        cfg_yaml.get("inp_path", "")
+        or cfg_yaml.get("cdb_path", "")
+        or cfg_yaml.get("mesh_path", "")
+    ).strip()
     if not inp_path:
-        raise ValueError("config.yaml 必须提供 inp_path。")
+        raise ValueError("config.yaml 必须提供 inp_path/cdb_path/mesh_path。")
     if not os.path.exists(inp_path):
-        raise FileNotFoundError(f"未找到 INP 文件：{inp_path}。请在 config.yaml 的 inp_path 中填写正确路径。")
-    asm = load_inp(inp_path)
+        raise FileNotFoundError(f"未找到网格文件：{inp_path}。请在 config.yaml 中填写正确路径。")
+    ext = os.path.splitext(inp_path)[1].lower()
+    if ext == ".cdb":
+        asm = load_cdb(inp_path)
+    else:
+        asm = load_inp(inp_path)
 
     # 2) 镜面表面名
     mirror_surface_name = cfg_yaml.get("mirror_surface_name", "").strip()
@@ -172,49 +181,47 @@ def _prepare_config_with_autoguess():
         print("[main] 提示：镜面表面名自动匹配失败：", e)
         print("       继续使用你提供的名字（可视化时按该名字模糊匹配）。")
 
-    # 3) 螺栓 up/down
-    bolt_surfaces = []
-    for b in cfg_yaml.get("bolts", []) or []:
-        bolt_surfaces.append(
+    # 3) 螺母拧紧：优先读取 nuts；否则自动探测 LUOMU* 部件
+    nut_specs = []
+    for b in cfg_yaml.get("nuts", []) or []:
+        nut_specs.append(
             {
                 "name": b.get("name", ""),
-                "up_key": b.get("up_surface_key", ""),
-                "down_key": b.get("down_surface_key", ""),
+                "part": b.get("part", b.get("part_name", "")),
+                "axis": b.get("axis", None),
+                "center": b.get("center", None),
             }
         )
 
-    preload_specs = []
-    for spec in bolt_surfaces:
-        try:
-            up_key = _auto_resolve_surface_keys(asm, spec["up_key"])
-            dn_key = _auto_resolve_surface_keys(asm, spec["down_key"])
-            preload_specs.append({"name": spec["name"], "up_key": up_key, "down_key": dn_key})
-        except Exception as e:
-            print(f"[main] 螺栓 '{spec['name']}' 的 up/down 自动匹配失败：{e}")
-            print("       请在 config.yaml 的 bolts 中修正后再跑。")
-            preload_specs.append(
-                {"name": spec["name"], "up_key": spec["up_key"], "down_key": spec["down_key"]}
-            )
+    if not nut_specs:
+        for pname in getattr(asm, "parts", {}).keys():
+            if "LUOMU" in pname.upper():
+                nut_specs.append({"name": pname, "part": pname})
+        if nut_specs:
+            print(f"[main] 自动识别螺母部件: {[d['part'] for d in nut_specs]}")
+        else:
+            print("[main] 未发现螺母部件（LUOMU*），将跳过拧紧约束。")
 
     # 4) 接触对
     contact_pairs_cfg = cfg_yaml.get("contact_pairs", []) or []
 
     contact_pairs = []
-    for p in contact_pairs_cfg:
-        try:
-            slave_key = _auto_resolve_surface_keys(asm, p["slave_key"])
-            master_key = _auto_resolve_surface_keys(asm, p["master_key"])
-            contact_pairs.append(
-                {
-                    "slave_key": slave_key,
-                    "master_key": master_key,
-                    "name": p.get("name", ""),
-                    "interaction": p.get("interaction", ""),
-                }
-            )
-        except Exception as e:
-            print(f"[main] 接触对 '{p.get('name','')}' 自动匹配失败：{e}")
-            print("       暂时跳过该接触对（可在 config.yaml 的 contact_pairs 中修正后再跑）。")
+    if contact_pairs_cfg:
+        for p in contact_pairs_cfg:
+            try:
+                slave_key = _auto_resolve_surface_keys(asm, p["slave_key"])
+                master_key = _auto_resolve_surface_keys(asm, p["master_key"])
+                contact_pairs.append(
+                    {
+                        "slave_key": slave_key,
+                        "master_key": master_key,
+                        "name": p.get("name", ""),
+                        "interaction": p.get("interaction", ""),
+                    }
+                )
+            except Exception as e:
+                print(f"[main] 接触对 '{p.get('name','')}' 自动匹配失败：{e}")
+                print("       暂时跳过该接触对（可在 config.yaml 的 contact_pairs 中修正后再跑）。")
 
     # 5) 材料与 Part→材料映射
     mat_props = cfg_yaml.get("material_properties", {}) or {}
@@ -261,13 +268,15 @@ def _prepare_config_with_autoguess():
 
     train_steps = int(optimizer_cfg.get("epochs", TrainerConfig.max_steps))
     n_contact_points_per_pair = int(cfg_yaml.get("n_contact_points_per_pair", TrainerConfig.n_contact_points_per_pair))
-    preload_face_points_each = int(cfg_yaml.get("preload_n_points_each", TrainerConfig.preload_n_points_each))
-    preload_min = cfg_yaml.get("preload_min", None)
-    preload_max = cfg_yaml.get("preload_max", None)
-    preload_range = cfg_yaml.get("preload_range_n", None)
+    preload_face_points_each = int(
+        cfg_yaml.get("tightening_n_points_each", cfg_yaml.get("preload_n_points_each", TrainerConfig.preload_n_points_each))
+    )
+    preload_min = cfg_yaml.get("tighten_angle_min", cfg_yaml.get("preload_min", None))
+    preload_max = cfg_yaml.get("tighten_angle_max", cfg_yaml.get("preload_max", None))
+    preload_range = cfg_yaml.get("tighten_angle_range", cfg_yaml.get("preload_range_n", None))
     if preload_min is None or preload_max is None:
         if preload_range is None:
-            raise ValueError("config.yaml 必须显式提供 preload_min/preload_max 或 preload_range_n。")
+            raise ValueError("config.yaml 必须显式提供 tighten_angle_min/max 或 tighten_angle_range。")
         preload_min, preload_max = float(preload_range[0]), float(preload_range[1])
     else:
         preload_min, preload_max = float(preload_min), float(preload_max)
@@ -280,12 +289,12 @@ def _prepare_config_with_autoguess():
         part2mat=part2mat,
         contact_pairs=contact_pairs,
         n_contact_points_per_pair=n_contact_points_per_pair,
-        preload_specs=preload_specs,
+        preload_specs=nut_specs,
         preload_n_points_each=preload_face_points_each,
         preload_min=preload_min,
         preload_max=preload_max,
         max_steps=train_steps,
-        viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
+        viz_samples_after_train=5,   # 随机 5 组，标题包含螺母拧紧角度
     )
     # 若 config.yaml 中提供了材料屈服强度，则默认取最小值作为全局屈服参考
     if yield_candidates:
@@ -301,6 +310,16 @@ def _prepare_config_with_autoguess():
     output_cfg = cfg_yaml.get("output_config", {}) or {}
     if "save_path" in output_cfg:
         cfg.out_dir = str(output_cfg["save_path"])
+
+    tight_cfg = cfg_yaml.get("tightening_config", {}) or {}
+    if "alpha" in tight_cfg:
+        cfg.tightening_cfg.alpha = float(tight_cfg["alpha"])
+    if "angle_unit" in tight_cfg:
+        cfg.tightening_cfg.angle_unit = str(tight_cfg["angle_unit"])
+    if "clockwise" in tight_cfg:
+        cfg.tightening_cfg.clockwise = bool(tight_cfg["clockwise"])
+    if "forward_chunk" in tight_cfg:
+        cfg.tightening_cfg.forward_chunk = int(tight_cfg["forward_chunk"])
 
     # Mixed precision: default to fp32 unless explicitly enabled in config.yaml
     if "mixed_precision" in cfg_yaml:
@@ -339,7 +358,7 @@ def _prepare_config_with_autoguess():
             lbfgs_cfg.get("reuse_last_batch", cfg.lbfgs_reuse_last_batch)
         )
 
-    # ===== 预紧分阶段 / 顺序设置 =====
+    # ===== 拧紧分阶段 / 顺序设置 =====
     staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
     stage_mode_top = cfg_yaml.get("preload_stage_mode", None)
     if stage_mode_top is not None:
@@ -366,20 +385,6 @@ def _prepare_config_with_autoguess():
         cfg.preload_sequence_shuffle = bool(staging_cfg["shuffle"])
     if "jitter" in staging_cfg:
         cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
-
-    relax_top = cfg_yaml.get("preload_rank_relaxation", None)
-    if relax_top is not None:
-        cfg.preload_cfg.rank_relaxation = float(relax_top)
-    if "relaxation" in staging_cfg:
-        cfg.preload_cfg.rank_relaxation = float(staging_cfg["relaxation"])
-    if "preload_warn_on_missing_stress" in cfg_yaml:
-        cfg.preload_cfg.warn_on_missing_stress = bool(
-            cfg_yaml.get("preload_warn_on_missing_stress")
-        )
-    if "preload_error_on_missing_stress" in cfg_yaml:
-        cfg.preload_cfg.error_on_missing_stress = bool(
-            cfg_yaml.get("preload_error_on_missing_stress")
-        )
 
     seq_overrides = cfg_yaml.get("preload_sequence", None)
     if seq_overrides:
@@ -422,6 +427,7 @@ def _prepare_config_with_autoguess():
         "w_tie": ("w_tie", "E_tie"),
         "w_bc": ("w_bc", "E_bc"),
         "w_pre": ("w_pre", "W_pre"),
+        "w_tight": ("w_tight", "E_tight"),
         "w_sigma": ("w_sigma", "E_sigma"),
         "w_eq": ("w_eq", "E_eq"),
         "w_reg": ("w_reg", "E_reg"),
@@ -539,6 +545,8 @@ def _prepare_config_with_autoguess():
     cfg.resample_contact_every = int(
         cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
     )
+    )
+    )
     cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
 
     if cfg.incremental_mode:
@@ -568,7 +576,7 @@ def _prepare_config_with_autoguess():
         cfg.elas_cfg.n_points_per_step = int(raw_n_points)
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 
-    # 3) 接触/预紧采样：根据阶段数做显存友好的调整
+    # 3) 接触/拧紧采样：根据阶段数做显存友好的调整
     stage_multiplier = 1
     if cfg.preload_use_stages:
         stage_multiplier = max(1, len(cfg.preload_specs))
@@ -586,12 +594,13 @@ def _prepare_config_with_autoguess():
 
     # 载荷跨度（用于适当放大/缩小每阶段采样规模）
     load_span = float(abs(getattr(cfg, "preload_max", 0.0) - getattr(cfg, "preload_min", 0.0)))
-    ref_span = 2000.0  # N；经验参考值，可按需要调整
+    unit = str(getattr(cfg.tightening_cfg, "angle_unit", "deg") or "deg").lower()
+    ref_span = 30.0 if unit.startswith("deg") else 0.5  # ??????? 30deg / 0.5rad?
     load_factor = 1.0
     if ref_span > 0:
         load_factor = min(2.0, max(0.5, load_span / ref_span))
     if stage_multiplier > 1 and abs(load_factor - 1.0) > 1e-3:
-        print(f"[main] 预紧载荷跨度 {load_span:g} N -> 每阶段采样系数 {load_factor:.2f}")
+        print(f"[main] 拧紧角度跨度 {load_span:g} -> 每阶段采样系数 {load_factor:.2f}")
 
     # 分阶段加载时，ContactOperator 内部的 update_every_steps 会被每阶段多次调用，
     # 这里按阶段数放大一次频率，保持与单阶段训练相近的物理更新节奏。
@@ -604,7 +613,7 @@ def _prepare_config_with_autoguess():
                 max(1, cfg.alm_update_every * stage_multiplier)
             )
             print(
-                f"[main] 分阶段预紧启用：ALM 更新频率放宽为每 {cfg.alm_update_every} 步一次，"
+                f"[main] 分阶段拧紧启用：ALM 更新频率放宽为每 {cfg.alm_update_every} 步一次，"
                 f"ContactOperator.update_every_steps={cfg.contact_cfg.update_every_steps}"
             )
         except Exception:
@@ -617,7 +626,7 @@ def _prepare_config_with_autoguess():
         approx_total_contact = per_stage_contact * stage_multiplier
         if per_stage_contact != contact_target:
             print(
-                "[main] 分阶段预紧启用：将每对接触采样从 "
+                "[main] 分阶段拧紧启用：将每对接触采样从 "
                 f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
             )
         # 分阶段计算仍会在同一梯度带内重复评估接触能，因此进一步限制总量
@@ -637,7 +646,7 @@ def _prepare_config_with_autoguess():
         approx_total_preload = per_stage_preload * stage_multiplier
         if per_stage_preload != preload_target:
             print(
-                "[main] 分阶段预紧启用：将每个螺栓端面的采样从 "
+                "[main] 分阶段拧紧启用：将每个螺母端面的采样从 "
                 f"{preload_target} 调整为每阶段 {per_stage_preload} (≈{approx_total_preload} 总点数)。"
             )
         preload_cap = 1024
@@ -645,7 +654,7 @@ def _prepare_config_with_autoguess():
             per_stage_preload = preload_cap
             approx_total_preload = per_stage_preload * stage_multiplier
             print(
-                "[main] 预紧点上限触发：将每阶段端面采样压缩到 "
+                "[main] 拧紧点上限触发：将每阶段端面采样压缩到 "
                 f"{per_stage_preload} (≈{approx_total_preload} 总点数)。"
             )
         cfg.preload_n_points_each = per_stage_preload
@@ -662,16 +671,16 @@ def _prepare_config_with_autoguess():
             per_stage_elas = max(1024, int(math.ceil(per_stage_elas * load_factor)))
             if per_stage_elas != elas_target:
                 print(
-                    "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
+                    "[main] 分阶段拧紧启用：将 DFEM 每步积分点从 "
                     f"{elas_target} 调整为每阶段 {per_stage_elas}。"
                 )
                 cfg.elas_cfg.n_points_per_step = per_stage_elas
 
 
-    # 5) 根据预紧力范围自动调整归一化（映射到约 [-1, 1]）
+    # 5) 根据拧紧角度范围自动调整归一化（映射到约 [-1, 1]）
     preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
     if preload_hi <= preload_lo:
-        raise ValueError("预紧力范围 preload_range_n 的上限必须大于下限。")
+        raise ValueError("拧紧角度范围 tighten_angle_range 的上限必须大于下限。")
     preload_mid = 0.5 * (preload_lo + preload_hi)
     preload_half_span = 0.5 * (preload_hi - preload_lo)
     cfg.model_cfg.preload_shift = preload_mid
@@ -707,7 +716,7 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
         print(f"[main] 未提供 --export，将 SavedModel 写入: {export_dir}")
     trainer.export_saved_model(export_dir)
 
-    print("\n[OK] 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
+    print("\n[OK] 训练完成！请到 'outputs/' 查看 5 张 “MIRROR UP” 变形云图（文件名包含螺母拧紧角度数值）。")
     print("   如需修改 INP 路径、表面名或超参，请编辑 config.yaml。")
 def main(argv=None):
     _setup_run_logs()

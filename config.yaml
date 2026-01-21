@@ -91,28 +91,28 @@ material_properties:
 # 2. Part → 材料映射（需与 INP 中 Part 名一致）
 # ------------------------------------------------------------
 part2mat:
-  mirror1: jingmian
-  mirror2: jingmian
+  MIRROR: jingmian
 
-  bolt1:   structural_steel
-  bolt2:   structural_steel
-  bolt3:   structural_steel
+  LUOSHUAN: structural_steel
+  LUOSHUAN1: structural_steel
+  LUOSHUAN2: structural_steel
+  LUOMU:    structural_steel
+  LUOMU1:    structural_steel
+  LUOMU2:    structural_steel
 
-  auto:    zhijia      # 支架/中间件使用 zhijia 材料
+  AUTO1:  zhijia      # support parts
 
 # ------------------------------------------------------------
 # 3. 预紧螺栓与装配面
 # ------------------------------------------------------------
-bolts:
-  - name: bolt1
-    up_surface_key:   'ASM::"bolt1 up"'
-    down_surface_key: 'ASM::"bolt1 down"'
-  - name: bolt2
-    up_surface_key:   'ASM::"bolt2 uo"'      # 注意：INP 中名为 "uo"
-    down_surface_key: 'ASM::"bolt2 down"'
-  - name: bolt3
-    up_surface_key:   'ASM::"bolt3 up"'
-    down_surface_key: 'ASM::"bolt3 down"'
+nuts:
+  - name: nut
+    part: LUOMU
+  - name: nut1
+    part: LUOMU1
+  - name: nut2
+    part: LUOMU2
+
 
 # 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
 preload_staging:
@@ -130,7 +130,7 @@ preload_staging:
 preload_use_stages: true
 preload_randomize_order: false
 preload_sequence:
-  - values: [1500, 1500, 1500]
+  - values: [20.0, 20.0, 20.0]
     order: [1, 2, 3]
 preload_sequence_repeat: 1
 preload_sequence_shuffle: false
@@ -139,47 +139,8 @@ preload_sequence_jitter: 0.0
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
-contact_pairs:
-  # INP 中定义的 13 组接触对（主/从表面名需与 INP 完全一致）
-  - master_key: 'ASM::"mirror1 auto"'
-    slave_key:  'ASM::"auto mirror1"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 auto down"'
-    slave_key:  'ASM::"bolt1 down"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 auto s"'
-    slave_key:  'ASM::"bolt1 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 mirror s"'
-    slave_key:  'ASM::"bolt1 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 auto down"'
-    slave_key:  'ASM::"bolt2 down"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt2 uo"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 auto s"'
-    slave_key:  'ASM::"bolt2 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 mirror s"'
-    slave_key:  'ASM::"bolt2 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 auto down"'
-    slave_key:  'ASM::"bolt3 down"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt3 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 auto s"'
-    slave_key:  'ASM::"bolt3 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror s"'
-    slave_key:  'ASM::"bolt3 s"'
-    interaction: 'fri'
+contact_pairs: []  # use CDB contact pairs
+
 
 # ------------------------------------------------------------
 # 4.5 边界条件（固定约束）
@@ -220,7 +181,7 @@ network_config:
 # 6. 后处理与可视化
 # ------------------------------------------------------------
 # 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
-mirror_surface_name: 'MIRROR up'
+mirror_surface_name: 'MIRROR UP'
 
 mixed_precision: null                     # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
 
@@ -274,7 +235,8 @@ loss_config:
     w_bc: 1.0      # 边界条件通常残差较小，给大一点
 
     # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
-    w_pre: 1.0     # 增强预紧外功项，使解对P更敏感（仅数值缩放；不改变P的物理含义）
+    w_pre: 0.0     # preload work disabled
+    w_tight: 1.0   # nut tightening penalty
 
     # 应力监督：用线弹性理论应力指导网络
     # Esig ~ 1e7, 需要非常小的权重
@@ -330,7 +292,7 @@ output_config:
   save_path: './results'
   visualize: true
   viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
-  viz_surface_source: "surface"         # 使用INP定义的MIRROR up表面（已修复，完整10648三角形）
+  viz_surface_source: "part_top"
   viz_refine_subdivisions: 2            # 细分以平滑
   viz_diagnose_blanks: true             # 启用空白诊断
   viz_auto_fill_blanks: true            # 自动填充小空洞
@@ -339,19 +301,22 @@ output_config:
 # ------------------------------------------------------------
 # 9. INP 文件路径
 # ------------------------------------------------------------
-inp_path: D:/shuangfan/shuangfan.inp
+inp_path: mir.cdb
 
 # ------------------------------------------------------------
 # 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
 # ------------------------------------------------------------
 debug_big_model: false             # 是否放大网络容量（默认关闭，避免无条件改模型尺寸）
-preload_min: 0.0                   # 预紧力范围下限 (N)，显式写死
-preload_max: 2000.0                # 预紧力范围上限 (N)，显式写死
-preload_warn_on_missing_stress: false  # residual 模式缺少应力头时是否仅警告
-preload_error_on_missing_stress: true  # residual 模式缺少应力头时直接报错
+tighten_angle_min: 0.0            # tightening angle min (deg)
+tighten_angle_max: 30.0           # tightening angle max (deg)
+tightening_config:
+  alpha: 1.0e3
+  angle_unit: deg
+  clockwise: true
+
 n_contact_points_per_pair: 800      # 每对接触面的采样数（单阶段）
-preload_n_points_each: 400         # 单个螺栓端面的采样数
-resample_contact_every: 50  # 每隔多少步重采样接触点（0=只采样首步）
+tightening_n_points_each: 400     # samples per nut surface
+resample_contact_every: 50  # contact resample period (steps)
 
 alm_update_every: 0                # 交由阶段内 ALM 更新
 

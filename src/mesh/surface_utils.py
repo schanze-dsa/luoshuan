@@ -136,7 +136,10 @@ C3D10_FACES = {
     "S4": (3, 4, 1, 10, 8, 7),
 }
 
-SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D6", "C3D10"}
+SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D6", "C3D10", "SOLID185"}
+
+# ANSYS contact/target surface elements
+SURFACE_ELEMENT_TYPES = {"TARGE170", "CONTA173", "CONTA174"}
 
 
 # -----------------------------
@@ -218,7 +221,35 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
     missing_tokens: int = 0
 
     def _add_face_as_tris(eid: int, face_label: str, etype: str, conn: List[int], owner: str):
-        et = etype.upper()
+        et = (etype or "").upper()
+        if et == "SOLID185":
+            et = "C3D8"
+
+        # Contact/target elements: treat element connectivity as a single face.
+        if et in SURFACE_ELEMENT_TYPES:
+            nodes = [int(n) for n in conn if n is not None]
+            # drop consecutive duplicates that appear in ANSYS contact elems
+            uniq = []
+            for n in nodes:
+                if not uniq or uniq[-1] != n:
+                    uniq.append(n)
+            nodes = uniq
+            if len(nodes) < 3:
+                skipped_types[et] = skipped_types.get(et, 0) + 1
+                return
+            if len(nodes) == 3:
+                tri_nodes.append((nodes[0], nodes[1], nodes[2]))
+                tri_eids.append(eid)
+                tri_labels.append(face_label or "S")
+            else:
+                tri_nodes.append((nodes[0], nodes[1], nodes[2]))
+                tri_nodes.append((nodes[0], nodes[2], nodes[3]))
+                tri_eids.extend([eid, eid])
+                tri_labels.extend([face_label or "S"] * 2)
+            owner_votes[owner] = owner_votes.get(owner, 0) + 1
+            added_types[et] = added_types.get(et, 0) + 1
+            return
+
         if et not in SUPPORTED_TYPES:
             skipped_types[et] = skipped_types.get(et, 0) + 1
             return
@@ -344,6 +375,10 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
     # Optional: estimate how much of the owning part's boundary this surface covers
     def _enumerate_faces(etype: str, conn: Iterable[int]) -> List[Tuple[str, Tuple[int, ...]]]:
         et = etype.upper()
+        if et == "SOLID185":
+            et = "C3D8"
+        if et == "SOLID185":
+            et = "C3D8"
         face_map = None
         if et == "C3D4":
             face_map = C3D4_FACES
@@ -457,6 +492,8 @@ def triangulate_part_boundary(part, part_name: str, log_summary: bool = False) -
 
     def _enumerate_faces(etype: str, conn: Iterable[int]) -> List[Tuple[str, Tuple[int, ...]]]:
         et = etype.upper()
+        if et == "SOLID185":
+            et = "C3D8"
         face_map = None
         if et == "C3D4":
             face_map = C3D4_FACES

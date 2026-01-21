@@ -1,0 +1,43 @@
+Plotly HTML Viewer Tasks (GPU/WebGL)
+
+Goal
+- Generate a single HTML viewer that renders solid parts, contact pairs, and nut tightening animation
+- Use Plotly WebGL (Mesh3d) for GPU-accelerated display in the browser
+
+Task List
+1) Design data flow
+   - Load config.yaml and mir.cdb using existing parsers
+   - Build solid meshes (all parts), contact surface meshes (per pair), and nut meshes
+   - Decide on default decimation/triangle caps for browser performance
+
+2) Implement Plotly HTML generator
+   - New script: tools/visualize_contact_tightening_plotly.py (or add --html to existing script)
+   - Create Mesh3d traces for:
+     - base solids (low alpha)
+     - bolts (medium alpha)
+     - nuts (high alpha, animated)
+     - master/slave contact surfaces (high contrast)
+   - Precompute animation frames by rotating nut vertices around axis
+   - Add slider and play controls for tightening frames
+
+3) Contact pair selection UI
+   - Build dropdown to select a single contact pair
+   - Toggle visibility: only the selected pair is highlighted
+   - Optional: "All pairs" view
+   - Optional: update camera to focus on selected pair bounds
+
+4) Output and metadata
+   - Write results/contact_viewer.html
+   - Write results/contact_viewer_meta.json (axes, centers, pair names)
+   - Keep filenames short and ASCII-only
+
+5) Validation
+   - Open HTML in a browser and verify:
+     - Solids render as closed surfaces
+     - One contact pair highlights clearly
+     - Nuts rotate in the correct direction around computed axes
+   - Confirm performance: no major lag for default decimation
+
+Notes
+- If Plotly is missing, install it (pip install plotly)
+- Avoid heavy geometry: use caps for triangles and prefer simplified meshes

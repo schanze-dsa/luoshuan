@@ -105,6 +105,16 @@ def build_dfem_subcells(asm, part2mat, materials):
 
     # 遍历所有 Part（CD3D8/C3D4 都被拆成四面体）
     for part_name, part in asm.parts.items():
+        # Skip parts that do not contain supported solid elements (e.g., contact shells).
+        has_supported = False
+        for blk in getattr(part, "element_blocks", []):
+            et = (blk.elem_type or "").upper()
+            if et in {"C3D4", "C3D8", "SOLID185"}:
+                has_supported = True
+                break
+        if not has_supported:
+            continue
+
         mat_name = part2mat.get(part_name, None)
         if mat_name is None:
             raise KeyError(f"Part '{part_name}' 无材料映射。请检查 part2mat。")
@@ -181,6 +191,8 @@ def build_dfem_subcells(asm, part2mat, materials):
 
         for blk in getattr(part, "element_blocks", []):
             etype = (blk.elem_type or "").upper()
+            if etype == "SOLID185":
+                etype = "C3D8"
             if etype not in {"C3D4", "C3D8"}:
                 # 目前仅支持常用的四面体/六面体，其他类型如 C3D10/C3D20 需额外实现拆分
                 continue

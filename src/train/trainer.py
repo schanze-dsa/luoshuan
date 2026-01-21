@@ -71,6 +71,7 @@ if _SRC_ROOT not in sys.path:
 
 # ---------- 项目模块 ----------
 from inp_io.inp_parser import load_inp, AssemblyModel
+from inp_io.cdb_parser import load_cdb
 from mesh.volume_quadrature import build_volume_points
 from mesh.contact_pairs import ContactPairSpec, build_contact_map, resample_contact_map
 from physics.material_lib import MaterialLibrary
@@ -79,7 +80,7 @@ from physics.elasticity_energy import ElasticityEnergy, ElasticityConfig
 from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
 from physics.tie_constraints import TiePenalty, TieConfig
-from physics.preload_model import PreloadWork, PreloadConfig, BoltSurfaceSpec
+from physics.tightening_model import NutTighteningPenalty, TighteningConfig, NutSpec
 from model.loss_energy import TotalEnergy, TotalConfig
 from train.loss_weights import LossWeightState, update_loss_weights, combine_loss
 from viz.mirror_viz import plot_mirror_deflection_by_name
@@ -140,7 +141,7 @@ class TrainerConfig:
     volume_rar_floor: float = 1e-8             # 基础重要性，避免全零
     volume_rar_ema_decay: float = 0.9          # 重要性 EMA 平滑系数（0~1，越大越平滑）
 
-    # 预紧
+    # 拧紧（螺母旋转角）
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
     preload_n_points_each: int = 800
 
@@ -181,7 +182,7 @@ class TrainerConfig:
         default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=0, use_pfor=False)
     )
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
-    preload_cfg: PreloadConfig = field(default_factory=PreloadConfig)
+    tightening_cfg: TighteningConfig = field(default_factory=TighteningConfig)
     total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
         w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0, w_eq=0.0
     ))
@@ -318,19 +319,20 @@ class Trainer:
                     arr = np.array(values_entry, dtype=np.float32).reshape(-1)
                 except Exception:
                     print(
-                        f"[preload] 忽略 preload_sequence[{idx}]，无法解析为浮点数组：{entry}"
+                        f"[tightening] 忽略 preload_sequence[{idx}]，无法解析为浮点数组：{entry}"
                     )
                     sanitized_orders.append(None)
                     continue
                 if arr.size == 0:
-                    print(f"[preload] 忽略 preload_sequence[{idx}]，未提供数值。")
+                    print(f"[tightening] 忽略 preload_sequence[{idx}]，未提供数值。")
                     sanitized_orders.append(None)
                     continue
+                nb = int(getattr(self, "_preload_dim", 0) or len(cfg.preload_specs) or 1)
                 if arr.size == 1:
-                    arr = np.repeat(arr, 3)
-                if arr.size != 3:
+                    arr = np.repeat(arr, nb)
+                if arr.size != nb:
                     print(
-                        f"[preload] 忽略 preload_sequence[{idx}]，需要 3 个数值，实际 {arr.size} 个。"
+                        f"[tightening] ?? preload_sequence[{idx}]??? {nb} ?????? {arr.size} ??"
                     )
                     sanitized_orders.append(None)
                     continue
@@ -341,14 +343,14 @@ class Trainer:
                         order_raw = np.array(order_entry, dtype=np.int32).reshape(-1)
                     except Exception:
                         print(
-                            f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，无法解析：{order_entry}"
+                            f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，无法解析：{order_entry}"
                         )
                         order_raw = None
                     if order_raw is not None:
                         nb = arr.size
                         if order_raw.size != nb:
                             print(
-                                f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，长度需为 {nb}。"
+                                f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，长度需为 {nb}。"
                             )
                         else:
                             if np.all(order_raw >= 1) and np.max(order_raw) <= nb and np.min(order_raw) >= 1:
@@ -356,7 +358,7 @@ class Trainer:
                             unique = sorted(set(order_raw.tolist()))
                             if unique != list(range(nb)):
                                 print(
-                                    f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，必须是 0~{nb-1} 的排列（或 1~{nb}）。"
+                                    f"[tightening] 忽略 preload_sequence[{idx}] 的顺序字段，必须是 0~{nb-1} 的排列（或 1~{nb}）。"
                                 )
                             else:
                                 order_arr = order_raw.astype(np.int32)
@@ -380,19 +382,19 @@ class Trainer:
                     )
                 hold = max(1, cfg.preload_sequence_repeat)
                 print(
-                    f"[preload] 已启用顺序载荷：{len(self._preload_sequence)} 组，",
+                    f"[tightening] 已启用顺序载荷：{len(self._preload_sequence)} 组，",
                     f"每组持续 {hold} 步。"
                 )
                 if cfg.preload_sequence_jitter > 0:
                     print(
-                        f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
+                        f"[tightening] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
                 self._set_preload_dim(self._preload_sequence[0].size)
             else:
-                print("[preload] preload_sequence 中有效条目为空，改为随机采样。")
+                print("[tightening] preload_sequence 中有效条目为空，改为随机采样。")
         if cfg.model_cfg.preload_scale:
             print(
-                f"[preload] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
+                f"[tightening] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
                 f"scale={cfg.model_cfg.preload_scale:.2f}"
             )
 
@@ -440,7 +442,7 @@ class Trainer:
 
         self.elasticity: Optional[ElasticityEnergy] = None
         self.contact: Optional[ContactOperator] = None
-        self.preload: Optional[PreloadWork] = None
+        self.tightening: Optional[NutTighteningPenalty] = None
         self.ties_ops: List[TiePenalty] = []
         self.bcs_ops: List[BoundaryPenalty] = []
         self._cp_specs: List[ContactPairSpec] = []
@@ -625,6 +627,7 @@ class Trainer:
             ("E_tie", "Etie"),
             ("E_bc", "Ebc"),
             ("W_pre", "Wpre"),
+            ("E_tight", "Etight"),
             ("E_sigma", "Esig"),
             ("E_eq", "Eeq"),
         ]
@@ -664,24 +667,21 @@ class Trainer:
         """
 
         try:
-            p1, p2, p3 = [int(x) for x in P_np.tolist()]
+            angles = [float(x) for x in P_np.tolist()]
             pin = float(Pi.numpy())
             energy_disp = self._format_energy_summary(parts)
 
-            bolt_txt = ""
-            preload_stats = None
+            tight_txt = ""
             if isinstance(stats, Mapping):
-                preload_stats = stats.get("preload") or stats.get("preload_stats")
-            if isinstance(preload_stats, Mapping):
-                bd = preload_stats.get("bolt_deltas")
-                if bd is None:
-                    bd = preload_stats.get("bolt_delta")
-                if bd is not None:
-                    if hasattr(bd, "numpy"):
-                        bd = bd.numpy()
+                tstats = stats.get("tightening")
+                if isinstance(tstats, Mapping):
+                    rms = tstats.get("rms")
+                    if hasattr(rms, "numpy"):
+                        rms = rms.numpy()
                     try:
-                        b1, b2, b3 = [float(x) for x in list(bd)[:3]]
-                        bolt_txt = f" Δ=[{b1:.3e},{b2:.3e},{b3:.3e}]"
+                        vals = [float(x) for x in list(rms)[:3]]
+                        if vals:
+                            tight_txt = " rms=[" + ",".join(f"{v:.2e}" for v in vals) + "]"
                     except Exception:
                         pass
 
@@ -821,8 +821,10 @@ class Trainer:
                 except Exception:
                     order_txt = " order=?"
             parts_disp = energy_disp or ""
+            unit = str(getattr(self.cfg.tightening_cfg, "angle_unit", "deg") or "deg")
+            angle_txt = ",".join(f"{a:.2f}" for a in angles)
             postfix = (
-                f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} | {parts_disp} {bolt_txt} "
+                f"theta=[{angle_txt}]{unit}{order_txt} Π={pin:.3e} | {parts_disp}{tight_txt} "
                 f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {vm_disp} {vm_ratio_disp}"
             )
             return postfix, "已记录"
@@ -1399,20 +1401,26 @@ class Trainer:
             raise RuntimeError(msg)
 
         steps = [
-            "Load INP", "Volume/Materials", "Elasticity",
-            "Contact", "Preload", "Ties/BCs",
+            "Load Mesh", "Volume/Materials", "Elasticity",
+            "Contact", "Tightening", "Ties/BCs",
             "Model/Opt", "Checkpoint"
         ]
 
-        print(f"[INFO] Build.start  inp_path={cfg.inp_path}")
+        print(f"[INFO] Build.start  mesh_path={cfg.inp_path}")
 
         pb_kwargs = dict(total=len(steps), desc="Build", leave=True)
         if cfg.build_bar_color:
             pb_kwargs["colour"] = cfg.build_bar_color
         with tqdm(**pb_kwargs) as pb:
-            # 1) INP
-            self.asm = load_inp(cfg.inp_path)
-            print(f"[INFO] Loaded INP: surfaces={len(self.asm.surfaces)} "
+            # 1) Mesh (INP/CDB)
+            ext = os.path.splitext(cfg.inp_path)[1].lower()
+            if ext == ".cdb":
+                self.asm = load_cdb(cfg.inp_path)
+                mesh_tag = "CDB"
+            else:
+                self.asm = load_inp(cfg.inp_path)
+                mesh_tag = "INP"
+            print(f"[INFO] Loaded {mesh_tag}: surfaces={len(self.asm.surfaces)} "
                   f"elsets={len(self.asm.elsets)} contact_pairs(raw)={len(getattr(self.asm, 'contact_pairs', []))}")
             pb.update(1)
 
@@ -1515,24 +1523,24 @@ class Trainer:
 
             pb.update(1)
 
-            # 5) 预紧（保留你的命名）
+            # 5) 螺母拧紧（旋转角）
             if cfg.preload_specs:
                 try:
-                    specs = [BoltSurfaceSpec(**d) for d in cfg.preload_specs]
-                    self.preload = PreloadWork(cfg.preload_cfg)
-                    self.preload.build_from_specs(
+                    specs = [NutSpec(**d) for d in cfg.preload_specs]
+                    self.tightening = NutTighteningPenalty(cfg.tightening_cfg)
+                    self.tightening.build_from_specs(
                         self.asm,
                         specs,
                         n_points_each=cfg.preload_n_points_each,
                         seed=cfg.seed,
                     )
-                    print(f"[preload] 已配置 {len(specs)} 个螺栓表面样本。")
+                    print(f"[tightening] 已配置 {len(specs)} 个螺母表面样本。")
                 except Exception as exc:
-                    print(f"[preload] 构建预紧样本失败：{exc}")
-                    self.preload = None
+                    print(f"[tightening] 构建拧紧样本失败：{exc}")
+                    self.tightening = None
             else:
-                self.preload = None
-                print("[preload] 未提供预紧配置。")
+                self.tightening = None
+                print("[tightening] 未提供螺母拧紧配置。")
             pb.update(1)
 
             # 6) Ties/BCs（如需，可在 cfg 里填充）
@@ -1620,7 +1628,7 @@ class Trainer:
             f"[contact] 状态：{'已启用' if self.contact is not None else '未启用'}"
         )
         print(
-            f"[preload] 状态：{'已启用' if self.preload is not None else '未启用'}"
+            f"[tightening] 状态：{'已启用' if self.tightening is not None else '未启用'}"
         )
 
     # ----------------- 组装总能量 -----------------
@@ -1629,7 +1637,8 @@ class Trainer:
         total.attach(
             elasticity=self.elasticity,
             contact=self.contact,
-            preload=self.preload,
+            preload=None,
+            tightening=self.tightening,
             ties=self.ties_ops,
             bcs=self.bcs_ops,
         )
@@ -2756,6 +2765,7 @@ class Trainer:
             "E_tie": self.cfg.total_cfg.w_tie,
             "E_bc": self.cfg.total_cfg.w_bc,
             "W_pre": self.cfg.total_cfg.w_pre,
+            "E_tight": self.cfg.total_cfg.w_tight,
             "E_sigma": self.cfg.total_cfg.w_sigma,
             "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
             "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
@@ -3101,14 +3111,17 @@ class Trainer:
         return result
 
     def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:
-        """生成固定的 6 组预紧案例以避免可视化阶段的随机性."""
+        """生成固定拧紧角案例以避免可视化阶段的随机性."""
 
-        nb = 3  # 现有镜面配置假定三颗螺栓
+        nb = int(getattr(self, "_preload_dim", 0) or len(self.cfg.preload_specs) or 1)
+        lo = float(self.cfg.preload_min)
+        hi = float(self.cfg.preload_max)
+        mid = 0.5 * (lo + hi)
 
         def _make_case(P_list: Sequence[float], order: Sequence[int]) -> Dict[str, np.ndarray]:
             P_arr = np.asarray(P_list, dtype=np.float32).reshape(-1)
             if P_arr.size != nb:
-                raise ValueError(f"固定可视化仅支持 {nb} 颗螺栓，收到 {P_arr.size} 维载荷。")
+                raise ValueError(f"固定可视化需要 {nb} 维角度输入，收到 {P_arr.size} 维。")
             case: Dict[str, np.ndarray] = {"P": P_arr}
             if not self.cfg.preload_use_stages:
                 return case
@@ -3121,13 +3134,16 @@ class Trainer:
 
         cases: List[Dict[str, np.ndarray]] = []
 
-        # 三组单螺栓 2000N，顺序固定为 1-2-3
-        for P_single in ([2000.0, 0.0, 0.0], [0.0, 2000.0, 0.0], [0.0, 0.0, 2000.0]):
-            cases.append(_make_case(P_single, order=[0, 1, 2]))
+        # 单螺母: 仅一个达到 hi，其余为 lo
+        for i in range(nb):
+            arr = [lo] * nb
+            arr[i] = hi
+            cases.append(_make_case(arr, order=list(range(nb))))
 
-        # 三组 1500N 等幅，采用不同拧紧顺序
-        for order in ([0, 1, 2], [0, 2, 1], [2, 1, 0]):
-            cases.append(_make_case([1500.0, 1500.0, 1500.0], order=order))
+        # 等幅: 全部为 mid，并给出两种顺序（若 nb>=2）
+        cases.append(_make_case([mid] * nb, order=list(range(nb))))
+        if nb >= 2:
+            cases.append(_make_case([mid] * nb, order=list(reversed(range(nb)))))
 
         return cases
 
@@ -3138,7 +3154,7 @@ class Trainer:
         cases = None
         if self._last_preload_case is not None:
             cases = [copy.deepcopy(self._last_preload_case)]
-            print("[viz] Using last training preload case for visualization.")
+            print("[viz] Using last training tightening case for visualization.")
         else:
             cases = self._fixed_viz_preload_cases()
         n_total = len(cases) if cases else n_samples
@@ -3154,7 +3170,9 @@ class Trainer:
                 order_display = "-".join(
                     str(int(o) + 1) for o in preload_case["order"].tolist()
                 )
-            title = f"{self.cfg.viz_title_prefix}  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
+            unit = str(getattr(self.cfg.tightening_cfg, "angle_unit", "deg") or "deg")
+            angle_txt = ",".join(f"{float(x):.2f}" for x in P.tolist())
+            title = f"{self.cfg.viz_title_prefix}  theta=[{angle_txt}]{unit}"
             if order_display:
                 title += f"  (order={order_display})"
             suffix = f"_{order_display.replace('-', '')}" if order_display else ""
@@ -3164,11 +3182,10 @@ class Trainer:
             params_full = self._make_preload_params(preload_case)
             params_eval = self._extract_final_stage_params(params_full, keep_context=True)
 
-            # Write a compact bolt-delta report next to the figure so tightening order
-            # effects can be inspected numerically without opening the plots.
-            if self.preload is not None and save_path:
+            # Write a compact tightening report next to the figure.
+            if self.tightening is not None and save_path:
                 try:
-                    bolt_report_path = os.path.splitext(save_path)[0] + "_bolts.txt"
+                    report_path = os.path.splitext(save_path)[0] + "_tightening.txt"
                     stage_rows = []
                     if (
                         self.cfg.preload_use_stages
@@ -3179,23 +3196,23 @@ class Trainer:
                         if stages_np.ndim == 2 and stages_np.shape[0] > 0:
                             for s in range(int(stages_np.shape[0])):
                                 params_s = self._extract_stage_params(params_full, s, keep_context=True)
-                                _, st = self.preload.energy(self.model.u_fn, params_s)
+                                _, st = self.tightening.energy(self.model.u_fn, params_s)
                                 stage_rows.append(
-                                    np.asarray(st.get("preload", {}).get("bolt_deltas", []))
+                                    np.asarray(st.get("tightening", {}).get("rms", []))
                                 )
-                    _, st_final = self.preload.energy(self.model.u_fn, params_eval)
-                    final_row = np.asarray(st_final.get("preload", {}).get("bolt_deltas", []))
+                    _, st_final = self.tightening.energy(self.model.u_fn, params_eval)
+                    final_row = np.asarray(st_final.get("tightening", {}).get("rms", []))
 
-                    with open(bolt_report_path, "w", encoding="utf-8") as fp:
-                        fp.write(f"P = {P.tolist()}  [N]\n")
+                    with open(report_path, "w", encoding="utf-8") as fp:
+                        fp.write(f"theta = {P.tolist()}  [{unit}]\n")
                         if self.cfg.preload_use_stages and "order" in preload_case:
                             fp.write(f"order = {preload_case['order'].tolist()}  (0-based)\n")
-                        fp.write("bolt_deltas = [Δ1, Δ2, Δ3]  [mm]\n")
+                        fp.write("rms = [r1, r2, ...]\n")
                         for s, row in enumerate(stage_rows, start=1):
                             fp.write(f"stage_{s}: {row.tolist()}\n")
                         fp.write(f"final: {final_row.tolist()}\n")
                 except Exception as exc:
-                    print(f"[viz] bolt delta report skipped: {exc}")
+                    print(f"[viz] tightening report skipped: {exc}")
             try:
                 _, _, data_path = self._call_viz(P, params_eval, save_path, title)
                 if self.cfg.viz_surface_enabled:
