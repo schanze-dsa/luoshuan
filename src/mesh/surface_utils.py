@@ -119,6 +119,15 @@ C3D4_FACES = {
     "S4": (1, 3, 4),  # Face 4: nodes (n1, n3, n4)
 }
 
+# 5-node pyramid (quad base + apex)
+C3D5_FACES = {
+    "S1": (1, 2, 3, 4),  # base
+    "S2": (1, 2, 5),
+    "S3": (2, 3, 5),
+    "S4": (3, 4, 5),
+    "S5": (4, 1, 5),
+}
+
 # 6-node wedge
 C3D6_FACES = {
     "S1": (1, 2, 3),          # triangular faces (bottom)
@@ -136,10 +145,57 @@ C3D10_FACES = {
     "S4": (3, 4, 1, 10, 8, 7),
 }
 
-SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D6", "C3D10", "SOLID185"}
+SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D5", "C3D6", "C3D10", "SOLID185"}
 
 # ANSYS contact/target surface elements
 SURFACE_ELEMENT_TYPES = {"TARGE170", "CONTA173", "CONTA174"}
+
+
+def _ordered_unique(nodes: Iterable[int]) -> List[int]:
+    uniq: List[int] = []
+    seen = set()
+    for n in nodes:
+        if n is None:
+            continue
+        v = int(n)
+        if v == 0:
+            continue
+        if v not in seen:
+            uniq.append(v)
+            seen.add(v)
+    return uniq
+
+
+def _normalize_etype_conn(etype: str, conn: Iterable[int]) -> Tuple[str, List[int]]:
+    et = (etype or "").upper()
+    conn_list = [int(n) for n in conn if n is not None and int(n) != 0]
+    if et != "SOLID185":
+        return et, conn_list
+
+    uniq = _ordered_unique(conn_list)
+    if len(uniq) == 4:
+        return "C3D4", uniq
+    if len(uniq) == 5:
+        return "C3D5", uniq
+    if len(uniq) == 6:
+        return "C3D6", uniq
+    if len(conn_list) >= 8:
+        return "C3D8", conn_list[:8]
+    return "C3D8", uniq
+
+
+def _face_map_for_type(etype: str) -> Optional[Dict[str, Tuple[int, ...]]]:
+    if etype == "C3D4":
+        return C3D4_FACES
+    if etype == "C3D5":
+        return C3D5_FACES
+    if etype == "C3D6":
+        return C3D6_FACES
+    if etype == "C3D8":
+        return C3D8_FACES
+    if etype == "C3D10":
+        return C3D10_FACES
+    return None
 
 
 # -----------------------------
@@ -195,6 +251,68 @@ def _emit_tris_from_face(face_nodes: Tuple[int, ...], tri_nodes: List[Tuple[int,
     return 0
 
 
+def _plane_basis(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return centroid and two in-plane basis vectors for points (N,3)."""
+    c = points.mean(axis=0)
+    X = points - c
+    if X.shape[0] < 3:
+        return c, np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+    # PCA: smallest eigenvector is normal; span is in-plane
+    w, v = np.linalg.eigh(X.T @ X)
+    n = v[:, int(np.argmin(w))]
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(float(np.dot(ref, n))) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(n, ref)
+    e1 /= np.linalg.norm(e1) + 1e-12
+    e2 = np.cross(n, e1)
+    e2 /= np.linalg.norm(e2) + 1e-12
+    return c, e1, e2
+
+
+def _convex_hull_indices(points_2d: np.ndarray) -> List[int]:
+    """Return convex hull vertex indices in CCW order (monotonic chain)."""
+    n = points_2d.shape[0]
+    if n <= 1:
+        return list(range(n))
+    idx = list(range(n))
+    idx.sort(key=lambda i: (points_2d[i, 0], points_2d[i, 1]))
+
+    def cross(o, a, b) -> float:
+        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower: List[int] = []
+    for i in idx:
+        while len(lower) >= 2 and cross(points_2d[lower[-2]], points_2d[lower[-1]], points_2d[i]) <= 0.0:
+            lower.pop()
+        lower.append(i)
+
+    upper: List[int] = []
+    for i in reversed(idx):
+        while len(upper) >= 2 and cross(points_2d[upper[-2]], points_2d[upper[-1]], points_2d[i]) <= 0.0:
+            upper.pop()
+        upper.append(i)
+
+    hull = lower[:-1] + upper[:-1]
+    return hull
+
+
+def _order_contact_nodes(nodes: List[int], asm_nodes: Dict[int, Tuple[float, float, float]]) -> List[int]:
+    """Order contact element nodes around the perimeter to avoid crossed triangles."""
+    uniq = _ordered_unique(nodes)
+    if len(uniq) <= 3:
+        return uniq
+    coords = np.asarray([asm_nodes[int(n)] for n in uniq], dtype=np.float64)
+    c, e1, e2 = _plane_basis(coords)
+    proj = np.stack([(coords - c) @ e1, (coords - c) @ e2], axis=1)
+    hull = _convex_hull_indices(proj)
+    if len(hull) >= 3:
+        return [uniq[i] for i in hull]
+    angles = np.arctan2(proj[:, 1], proj[:, 0])
+    order = np.argsort(angles)
+    return [uniq[int(i)] for i in order]
+
+
 def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: bool = False) -> TriSurface:
     """
     Resolve a surface (part/assembly scope, ELEMENT) to a triangulated surface.
@@ -222,18 +340,15 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
 
     def _add_face_as_tris(eid: int, face_label: str, etype: str, conn: List[int], owner: str):
         et = (etype or "").upper()
-        if et == "SOLID185":
-            et = "C3D8"
-
         # Contact/target elements: treat element connectivity as a single face.
         if et in SURFACE_ELEMENT_TYPES:
-            nodes = [int(n) for n in conn if n is not None]
+            nodes = [int(n) for n in conn if n is not None and int(n) != 0]
             # drop consecutive duplicates that appear in ANSYS contact elems
             uniq = []
             for n in nodes:
                 if not uniq or uniq[-1] != n:
                     uniq.append(n)
-            nodes = uniq
+            nodes = _order_contact_nodes(uniq, asm.nodes)
             if len(nodes) < 3:
                 skipped_types[et] = skipped_types.get(et, 0) + 1
                 return
@@ -242,31 +357,27 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
                 tri_eids.append(eid)
                 tri_labels.append(face_label or "S")
             else:
-                tri_nodes.append((nodes[0], nodes[1], nodes[2]))
-                tri_nodes.append((nodes[0], nodes[2], nodes[3]))
-                tri_eids.extend([eid, eid])
-                tri_labels.extend([face_label or "S"] * 2)
+                for i in range(1, len(nodes) - 1):
+                    tri_nodes.append((nodes[0], nodes[i], nodes[i + 1]))
+                    tri_eids.append(eid)
+                    tri_labels.append(face_label or "S")
             owner_votes[owner] = owner_votes.get(owner, 0) + 1
-            added_types[et] = added_types.get(et, 0) + 1
+            added_types[et] = added_types.get(et, 0) + max(len(nodes) - 2, 1)
             return
 
+        et, conn_use = _normalize_etype_conn(et, conn)
         if et not in SUPPORTED_TYPES:
             skipped_types[et] = skipped_types.get(et, 0) + 1
             return
 
-        face: Optional[Tuple[int, ...]] = None
-        if et == "C3D4":
-            face = C3D4_FACES.get(face_label)
-        elif et == "C3D8":
-            face = C3D8_FACES.get(face_label)
-        elif et == "C3D6":
-            face = C3D6_FACES.get(face_label)
-        elif et == "C3D10":
-            face = C3D10_FACES.get(face_label)
+        face_map = _face_map_for_type(et)
+        if face_map is None:
+            return
+        face = face_map.get(face_label)
 
         if not face:
             return
-        node_ids = tuple(conn[i - 1] for i in face)
+        node_ids = tuple(conn_use[i - 1] for i in face)
         n_tris = _emit_tris_from_face(node_ids, tri_nodes)
         if n_tris == 0:
             return
@@ -374,23 +485,10 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
 
     # Optional: estimate how much of the owning part's boundary this surface covers
     def _enumerate_faces(etype: str, conn: Iterable[int]) -> List[Tuple[str, Tuple[int, ...]]]:
-        et = etype.upper()
-        if et == "SOLID185":
-            et = "C3D8"
-        if et == "SOLID185":
-            et = "C3D8"
-        face_map = None
-        if et == "C3D4":
-            face_map = C3D4_FACES
-        elif et == "C3D8":
-            face_map = C3D8_FACES
-        elif et == "C3D6":
-            face_map = C3D6_FACES
-        elif et == "C3D10":
-            face_map = C3D10_FACES
+        et, conn_list = _normalize_etype_conn(etype, conn)
+        face_map = _face_map_for_type(et)
         if face_map is None:
             return []
-        conn_list = list(conn)
         if len(conn_list) == 0:
             return []
         out: List[Tuple[str, Tuple[int, ...]]] = []
@@ -491,21 +589,10 @@ def triangulate_part_boundary(part, part_name: str, log_summary: bool = False) -
     added: Dict[str, int] = {}
 
     def _enumerate_faces(etype: str, conn: Iterable[int]) -> List[Tuple[str, Tuple[int, ...]]]:
-        et = etype.upper()
-        if et == "SOLID185":
-            et = "C3D8"
-        face_map = None
-        if et == "C3D4":
-            face_map = C3D4_FACES
-        elif et == "C3D8":
-            face_map = C3D8_FACES
-        elif et == "C3D6":
-            face_map = C3D6_FACES
-        elif et == "C3D10":
-            face_map = C3D10_FACES
+        et, conn_list = _normalize_etype_conn(etype, conn)
+        face_map = _face_map_for_type(et)
         if face_map is None:
             return []
-        conn_list = list(conn)
         if len(conn_list) == 0:
             return []
         out: List[Tuple[str, Tuple[int, ...]]] = []
@@ -516,8 +603,39 @@ def triangulate_part_boundary(part, part_name: str, log_summary: bool = False) -
             out.append((lbl, tuple(conn_list[i - 1] for i in idxs)))
         return out
 
+    def _flip_face_nodes(nodes: Tuple[int, ...]) -> Tuple[int, ...]:
+        if len(nodes) == 3:
+            return (nodes[0], nodes[2], nodes[1])
+        if len(nodes) == 4:
+            return (nodes[0], nodes[3], nodes[2], nodes[1])
+        if len(nodes) == 6:
+            a, b, c, ab, bc, ac = nodes
+            return (a, c, b, ac, bc, ab)
+        return tuple(reversed(nodes))
+
+    def _orient_face_outward(nodes: Tuple[int, ...], elem_conn: Iterable[int]) -> Tuple[int, ...]:
+        if len(nodes) < 3:
+            return nodes
+        try:
+            face_xyz = _fetch_xyz(part, np.asarray(nodes[:3], dtype=np.int64))
+            n = np.cross(face_xyz[1] - face_xyz[0], face_xyz[2] - face_xyz[0])
+            if not np.isfinite(n).all() or np.linalg.norm(n) < 1e-12:
+                return nodes
+            elem_nodes = _ordered_unique(elem_conn)
+            if len(elem_nodes) < 4:
+                return nodes
+            elem_xyz = _fetch_xyz(part, np.asarray(elem_nodes, dtype=np.int64))
+            elem_center = elem_xyz.mean(axis=0)
+            face_all = _fetch_xyz(part, np.asarray(nodes, dtype=np.int64))
+            face_center = face_all.mean(axis=0)
+            if np.dot(n, face_center - elem_center) < 0.0:
+                return _flip_face_nodes(nodes)
+        except Exception:
+            return nodes
+        return nodes
+
     face_hits: Dict[Tuple[int, ...], int] = {}
-    face_payload: Dict[Tuple[int, ...], Tuple[int, str]] = {}
+    face_payload: Dict[Tuple[int, ...], Tuple[int, str, Tuple[int, ...], List[int]]] = {}
 
     for blk in part.element_blocks:
         et = (blk.elem_type or "").upper()
@@ -529,12 +647,13 @@ def triangulate_part_boundary(part, part_name: str, log_summary: bool = False) -
             for lbl, nodes in _enumerate_faces(et, conn):
                 key = tuple(sorted(nodes))
                 face_hits[key] = face_hits.get(key, 0) + 1
-                face_payload[key] = (eid, lbl)
+                face_payload[key] = (eid, lbl, nodes, list(conn))
 
     exterior_faces = {k: v for k, v in face_payload.items() if face_hits.get(k, 0) == 1}
 
-    for nodes, (eid, lbl) in exterior_faces.items():
-        n_tris = _emit_tris_from_face(nodes, tri_nodes)
+    for _, (eid, lbl, nodes, elem_conn) in exterior_faces.items():
+        nodes_oriented = _orient_face_outward(nodes, elem_conn)
+        n_tris = _emit_tris_from_face(nodes_oriented, tri_nodes)
         if n_tris == 0:
             continue
         tri_eids.extend([eid] * n_tris)

@@ -139,7 +139,10 @@ preload_sequence_jitter: 0.0
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
-contact_pairs: []  # use CDB contact pairs
+contact_pairs:
+  - master_key: GROUP_TARG_CONT_8_MASTER_COMP
+    slave_key: GROUP_TARG_CONT_8_SLAVE_COMP
+    name: contact_8
 
 
 # ------------------------------------------------------------
